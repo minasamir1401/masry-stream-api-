@@ -90,7 +90,7 @@ async def add_cache_headers(request, call_next):
     response = await call_next(request)
     if (
         request.method == "GET"
-        and request.url.path.startswith("/api/anime/")
+        and (request.url.path.startswith("/api/anime/") or request.url.path.startswith("/api/movies"))
         and not request.url.path.startswith("/api/admin/")
     ):
         if response.status_code >= 400 or any(part in request.url.path for part in ("/stream", "/subtitles/", "/video/", "/hls/")):
