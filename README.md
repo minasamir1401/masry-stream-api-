@@ -38,3 +38,4 @@ Asynchronous streaming & metadata engine built with Python 3.11, FastAPI, SQLAlc
 docker build -t masry-stream-api .
 docker run -p 8000:8000 masry-stream-api
 ```
+

@@ -22,6 +22,11 @@ class Base(DeclarativeBase):
 
 def get_engine():
     db_url = settings.DATABASE_URL
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif db_url.startswith("postgresql://") and not db_url.startswith("postgresql+"):
+        db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
     is_sqlite = db_url.startswith("sqlite")
 
     engine_kwargs = {
@@ -104,5 +109,7 @@ async def init_db():
             except Exception as err:
                 logger.warning("Could not preload hidden anime ids: %s", err)
         else:
-            raise e
+            logger.error(
+                "Database initialization failed: %s. Continuing startup in degraded mode.", e
+            )
 

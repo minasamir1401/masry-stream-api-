@@ -12,6 +12,18 @@ class Settings(BaseSettings):
     VERSION: str = "1.0.0"
     DEBUG: bool = True
 
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def normalize_db_url(cls, v: Any) -> str:
+        if isinstance(v, str):
+            clean = v.strip()
+            if clean.startswith("postgres://"):
+                return clean.replace("postgres://", "postgresql+asyncpg://", 1)
+            if clean.startswith("postgresql://") and not clean.startswith("postgresql+"):
+                return clean.replace("postgresql://", "postgresql+asyncpg://", 1)
+            return clean
+        return str(v)
+
     @field_validator("DEBUG", mode="before")
     @classmethod
     def parse_debug(cls, v: Any) -> bool:
