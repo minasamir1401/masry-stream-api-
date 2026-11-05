@@ -47,6 +47,22 @@ class HlsGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         self.assertFalse(client.is_closed)
 
+    async def test_every_ip_bound_hls_host_is_served_through_our_origin(self):
+        from app.routers.anime import get_anime_stream
+        from app.services.animetna import HLS_MEDIA_SUFFIXES
+        servers = [{"name": f"s{i}", "type": "hls", "url": f"https://cdn{suffix}/master.m3u8?token=ip-bound"}
+                   for i, suffix in enumerate(HLS_MEDIA_SUFFIXES)]
+        servers.append({"name": "admin", "type": "hls", "url": "https://cdn.97bf1.com/a.m3u8", "is_custom": True})
+        with patch("app.routers.anime.anime_service.get_stream_sources", new_callable=AsyncMock,
+                   return_value={"availability": "available", "servers": servers}), \
+             patch("app.routers.anime.playback_sources.register", new_callable=AsyncMock, return_value="c" * 24), \
+             patch("app.routers.anime.anime_override_service.get_hidden_anime_ids_sync", return_value=set()):
+            result = await get_anime_stream(101348, 5)
+        relayed = [server for server in result["servers"] if not server.get("is_custom")]
+        self.assertEqual(len(relayed), len(HLS_MEDIA_SUFFIXES))
+        self.assertTrue(all(server["playback_url"] == f"/api/anime/101348/hls/5?source={'c' * 24}" for server in relayed))
+        self.assertNotIn("playback_url", result["servers"][-1])
+
 
 if __name__ == "__main__":
     unittest.main()

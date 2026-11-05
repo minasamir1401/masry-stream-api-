@@ -18,4 +18,9 @@ RUN mkdir -p /app/data /app/cache/posters
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--timeout-keep-alive", "30", "--proxy-headers", "--forwarded-allow-ips=*"]
+# Scraping and relaying are I/O bound; two async workers are enough and
+# keep per-worker scrape caches from multiplying upstream requests.
+ENV DEBUG=false \
+    WEB_CONCURRENCY=2
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "30", "--proxy-headers", "--forwarded-allow-ips=*"]

@@ -12,7 +12,7 @@ from app.services.anime_override_service import anime_override_service
 from app.services.playback_sources import playback_sources
 from app.services.hls_gateway import relay as relay_hls
 from app.services.video_http import get_video_client
-from app.services.animetna import MP4_MEDIA_SUFFIXES, is_anime4up_host, media_request_headers
+from app.services.animetna import HLS_MEDIA_SUFFIXES, MP4_MEDIA_SUFFIXES, is_anime4up_host, media_request_headers
 from app.services.hero_images import hero_images
 from app.services.airing_schedule import airing_schedule
 
@@ -177,7 +177,8 @@ async def get_anime_stream(anime_id: int, episode: int = 1, refresh: bool = Fals
         if source.get("type") == "direct" and not source.get("is_custom"):
             token = await playback_sources.register(anime_id, episode, source)
             source = {**source, "playback_url": f"/api/anime/{anime_id}/video/{episode}?source={token}"}
-        elif source.get("type") == "hls" and (urlsplit(source["url"]).hostname or "").endswith(".tnmr.org") and not source.get("is_custom"):
+        elif source.get("type") == "hls" and (urlsplit(source["url"]).hostname or "").endswith(HLS_MEDIA_SUFFIXES) and not source.get("is_custom"):
+            # CDN tokens are bound to the scraper's IP, so playback must go through this server.
             token = await playback_sources.register(anime_id, episode, source)
             source = {**source, "playback_url": f"/api/anime/{anime_id}/hls/{episode}?source={token}"}
         servers.append(source)

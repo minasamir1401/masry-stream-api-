@@ -18,7 +18,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("MasryStream")
-for library in ("httpx", "httpcore"):
+for library in ("httpx", "httpcore", "aiosqlite", "asyncpg", "sqlalchemy.engine"):
     logging.getLogger(library).setLevel(logging.WARNING)
 
 
