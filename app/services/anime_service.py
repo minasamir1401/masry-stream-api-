@@ -534,7 +534,7 @@ class AnimeService:
                 "embed_url": merged[0]["url"] if merged else None,
             }
         elif result.get("servers"):
-            await db_cache.set(db_key, result, min(TTL_STREAM, 120))
+            await db_cache.set(db_key, result, TTL_STREAM)
         elif refresh:
             await db_cache.delete(db_key)
 

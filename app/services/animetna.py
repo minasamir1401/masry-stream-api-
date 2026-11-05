@@ -31,12 +31,26 @@ async def collect_available(awaitables, timeout=12):
     """Keep completed mirrors even if another host never finishes responding."""
     tasks = [asyncio.create_task(item) for item in awaitables]
     pending = set(tasks)
+    completed = set()
     try:
         if not tasks:
             return []
-        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        deadline = time.monotonic() + timeout
+        while pending and time.monotonic() < deadline:
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=max(0, deadline - time.monotonic()),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            completed.update(done)
+            working = sum(
+                1 for t in completed
+                if not t.cancelled() and t.exception() is None and t.result()
+            )
+            if working >= 4:
+                deadline = min(deadline, time.monotonic() + 1.5)
         return [task.result() for task in tasks
-                if task in done and not task.cancelled() and task.exception() is None]
+                if task in completed and not task.cancelled() and task.exception() is None]
     finally:
         for task in pending:
             task.cancel()

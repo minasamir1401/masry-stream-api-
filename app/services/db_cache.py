@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 TTL_ANIME_DETAIL = 86_400       # 24 h
 TTL_LIST         = 1_800        # 30 min
-TTL_STREAM       = 600          # 10 min
+TTL_STREAM       = 1_800        # 30 min
 TTL_HOMEPAGE     = 3_600        # 1 h
 
 
@@ -35,8 +35,8 @@ class DBCache:
     """Thin async wrapper around the cache_entries table."""
 
     # In-memory L1 layer avoids a DB round-trip for hot keys.
-    # Bounded to 1 000 entries; evicts LRU-style on overflow.
-    _L1_MAX = 1_000
+    # Sized to hold several 300-segment HLS playlists plus catalog metadata.
+    _L1_MAX = 20_000
     _l1: Dict[str, tuple] = {}   # key -> (expires_at, value)
 
     # ------------------------------------------------------------------ #
@@ -90,14 +90,15 @@ class DBCache:
             logger.debug("db_cache.delete failed for %s: %s", key, exc)
 
     async def set_many(self, values: Dict[str, Any], ttl: int) -> None:
-        """Persist a catalog page in one transaction, retaining playback metadata."""
+        """Persist a catalog page or HLS playlist map in one bulk transaction."""
+        if not values:
+            return
         expires_at = int(time.time()) + ttl
         for key, value in values.items():
             self._l1_set(key, time.monotonic() + ttl, value)
         try:
             async with AsyncSessionLocal() as session:
-                for key, value in values.items():
-                    await self._db_set(session, key, value, expires_at)
+                await self._db_set_many(session, values, expires_at)
                 await session.commit()
         except Exception as exc:
             logger.debug("db_cache.set_many failed: %s", exc)
@@ -171,6 +172,31 @@ class DBCache:
                     "VALUES (:key, :value, :expires_at)"
                 ),
                 {"key": key, "value": payload, "expires_at": expires_at},
+            )
+
+    @staticmethod
+    async def _db_set_many(
+        session: AsyncSession, values: Dict[str, Any], expires_at: int
+    ) -> None:
+        rows = [
+            {"key": key, "value": json.dumps(value, default=str), "expires_at": expires_at}
+            for key, value in values.items()
+        ]
+        dialect = session.bind.dialect.name if session.bind else "sqlite"  # type: ignore[union-attr]
+        if dialect == "postgresql":
+            stmt = pg_insert(CacheEntry).values(rows)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["key"],
+                set_={"value": stmt.excluded.value, "expires_at": stmt.excluded.expires_at},
+            )
+            await session.execute(stmt)
+        else:
+            await session.execute(
+                text(
+                    "INSERT OR REPLACE INTO cache_entries (key, value, expires_at) "
+                    "VALUES (:key, :value, :expires_at)"
+                ),
+                rows,
             )
 
 

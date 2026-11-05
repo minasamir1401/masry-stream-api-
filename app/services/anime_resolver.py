@@ -281,6 +281,8 @@ class AnimeStreamResolver:
                             if not task.cancelled() and task.exception() is None:
                                 servers.extend(server for server in task.result()
                                                if server.get("type") in ("direct", "hls"))
+                        if servers:
+                            deadline = min(deadline, time.monotonic() + 2.2)
                 finally:
                     for task in pending:
                         task.cancel()
@@ -345,7 +347,15 @@ class AnimeStreamResolver:
             match = re.search(r"(2160|1080|720|480|360)p?", server["name"])
             return -int(match[1]) if match else 0
 
-        for s in sorted(servers, key=lambda source: (source["type"] != "hls", quality_rank(source))):
+        def cdn_startup_rank(server):
+            host = urllib.parse.urlsplit(server.get("url", "")).hostname or ""
+            if host.endswith((".97bf1.com", ".friwduh.shop", ".s1q2105.com")):
+                return 0
+            if host.endswith(".cloudwindow-route.com"):
+                return 1
+            return 2
+
+        for s in sorted(servers, key=lambda source: (source["type"] != "hls", quality_rank(source), cdn_startup_rank(source))):
             parsed = urllib.parse.urlsplit(s["url"])
             # Two catalogs may list the same Mixdrop file with different signatures.
             identity = (parsed.hostname, parsed.path) if (parsed.hostname or "").endswith(".mxcontent.net") else s["url"]
@@ -364,7 +374,7 @@ class AnimeStreamResolver:
             "diagnostics": {"providers": provider_checks, "issues": source_trace.summary(issues)},
         }
 
-        ttl = 120 if any(server["type"] == "hls" for server in deduped_servers) else 300
+        ttl = 900 if any(server["type"] == "hls" for server in deduped_servers) else 1800
         self._stream_cache[cache_key] = (time.monotonic() + (ttl if deduped_servers else 5), result)
         return result
 
