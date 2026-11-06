@@ -72,6 +72,22 @@ class Settings(BaseSettings):
     STREAM_CHUNK_SIZE: int = 1024 * 1024
     STREAM_PREBUFFER_BYTES: int = 2 * 1024 * 1024
 
+    # Anti-Scraping & Streaming Security
+    SECURITY_SIGNING_KEY: str = "animeclover-secure-streaming-hmac-key-2026-production"
+    SECURITY_TOKEN_TTL_SECONDS: int = 300
+    ENABLE_ANTI_BOT: bool = True
+    ENABLE_TARPIT: bool = True
+    TARPIT_DELAY_SECONDS: float = 3.0
+    MAX_CONSECUTIVE_SESSION_HOURS: float = 10.0
+    SESSION_INACTIVITY_BREAK_MINUTES: float = 30.0
+    CONSECUTIVE_LOCKOUT_HOURS: float = 1.0
+    ALLOWED_STREAM_HOSTS: List[str] = [
+        "animeclover.click",
+        "www.animeclover.click",
+        "localhost",
+        "127.0.0.1",
+    ]
+
     CORS_ORIGINS: List[str] = ["*"]
 
     model_config = SettingsConfigDict(

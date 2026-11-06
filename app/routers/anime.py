@@ -15,6 +15,7 @@ from app.services.video_http import get_video_client
 from app.services.animetna import HLS_MEDIA_SUFFIXES, MP4_MEDIA_SUFFIXES, is_anime4up_host, media_request_headers
 from app.services.hero_images import hero_images
 from app.services.airing_schedule import airing_schedule
+from app.services.security_shield import security_shield
 
 logger = logging.getLogger(__name__)
 
@@ -161,12 +162,22 @@ async def get_anime_details(anime_id: int):
 
 @router.get("/{anime_id}/stream")
 @router.get("/{anime_id}/stream/{episode}")
-async def get_anime_stream(anime_id: int, episode: int = 1, refresh: bool = False):
+async def get_anime_stream(request: Request, anime_id: int, episode: int = 1, refresh: bool = False):
+    is_blocked, block_reason, retry_after = security_shield.validate_request_access(request)
+    if is_blocked:
+        await security_shield.apply_tarpit()
+        headers = {"Retry-After": str(retry_after)} if retry_after else None
+        raise HTTPException(403, block_reason, headers=headers)
+
     hidden_ids = anime_override_service.get_hidden_anime_ids_sync()
     if anime_id in hidden_ids:
         raise HTTPException(status_code=404, detail="الأنمي المطلوب غير متاح حالياً")
     if episode < 1:
         raise HTTPException(422, "رقم الحلقة غير صالح")
+
+    client_ip = security_shield.get_client_ip(request)
+    user_agent = request.headers.get("user-agent", "")
+
     sources = await anime_service.get_stream_sources(anime_id=anime_id, episode=episode, refresh=refresh)
     if sources.get("availability") == "metadata_unavailable":
         raise HTTPException(503, "تعذّر جلب بيانات هذا الأنمي. أعد المحاولة بعد قليل.", headers={"Retry-After": "15"})
@@ -176,29 +187,68 @@ async def get_anime_stream(anime_id: int, episode: int = 1, refresh: bool = Fals
         source = {**source, "name": clean_name}
         if source.get("type") == "direct" and not source.get("is_custom"):
             token = await playback_sources.register(anime_id, episode, source)
-            source = {**source, "playback_url": f"/api/anime/{anime_id}/video/{episode}?source={token}"}
+            st_token = security_shield.generate_token(f"{anime_id}:{episode}:{token}", client_ip, user_agent)
+            source = {**source, "playback_url": f"/api/anime/{anime_id}/video/{episode}?source={token}&st={st_token}"}
         elif source.get("type") == "hls" and (urlsplit(source["url"]).hostname or "").endswith(HLS_MEDIA_SUFFIXES) and not source.get("is_custom"):
-            # CDN tokens are bound to the scraper's IP, so playback must go through this server.
             token = await playback_sources.register(anime_id, episode, source)
-            source = {**source, "playback_url": f"/api/anime/{anime_id}/hls/{episode}?source={token}"}
+            st_token = security_shield.generate_token(f"{anime_id}:{episode}:{token}", client_ip, user_agent)
+            source = {**source, "playback_url": f"/api/anime/{anime_id}/hls/{episode}?source={token}&st={st_token}"}
         servers.append(source)
     return {**sources, "servers": servers}
 
 
 @router.get("/{anime_id}/hls/{episode}")
-async def get_hls_asset(anime_id: int, episode: int, request: Request, source: str, asset: Optional[str] = None):
-    return await relay_hls(anime_id, episode, source, asset, request.headers.get("range"))
+async def get_hls_asset(
+    anime_id: int,
+    episode: int,
+    request: Request,
+    source: str,
+    asset: Optional[str] = None,
+    st: Optional[str] = None,
+):
+    return await relay_hls(
+        anime_id=anime_id,
+        episode=episode,
+        source=source,
+        asset=asset,
+        byte_range=request.headers.get("range"),
+        request=request,
+        st=st,
+    )
 
 
 @router.get("/{anime_id}/video/{episode}")
-async def get_anime_video(anime_id: int, episode: int, request: Request, server: int = Query(0, ge=0), source: Optional[str] = None):
-    """Relay a verified episode source; never accept an arbitrary URL from clients."""
+async def get_anime_video(
+    anime_id: int,
+    episode: int,
+    request: Request,
+    server: int = Query(0, ge=0),
+    source: Optional[str] = None,
+    st: Optional[str] = None,
+):
+    """Relay a verified episode source; requires security token validation."""
+    is_blocked, block_reason, retry_after = security_shield.validate_request_access(request)
+    if is_blocked:
+        await security_shield.apply_tarpit()
+        headers = {"Retry-After": str(retry_after)} if retry_after else None
+        raise HTTPException(403, block_reason, headers=headers)
+
+    if not security_shield.verify_referrer_origin(request):
+        await security_shield.apply_tarpit()
+        raise HTTPException(403, "Direct hotlinking is prohibited")
+
+    client_ip = security_shield.get_client_ip(request)
+    user_agent = request.headers.get("user-agent", "")
+
     if source:
         if not re.fullmatch(r"[a-f0-9]{24}", source):
             raise HTTPException(422, "رابط التشغيل غير صالح")
+        valid, reason = security_shield.verify_token(st, f"{anime_id}:{episode}:{source}", client_ip, user_agent)
+        if not valid:
+            await security_shield.apply_tarpit(delay=1.0)
+            raise HTTPException(403, f"انتهت صلاحية جلسة المشاهدة أو الرمز غير صالح ({reason})")
         selected = await playback_sources.get(anime_id, episode, source)
     else:
-        # Keep already-open players compatible with the previous URL format.
         sources = await anime_service.get_stream_sources(anime_id, episode)
         servers = sources.get("servers", [])
         selected = servers[server] if server < len(servers) else None

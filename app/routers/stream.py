@@ -11,6 +11,7 @@ from app.config import settings
 from app.database import get_db
 from app.models import Media
 from app.services.streaming_service import streaming_service
+from app.services.security_shield import security_shield
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,16 @@ async def stream_media(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    is_blocked, block_reason, retry_after = security_shield.validate_request_access(request)
+    if is_blocked:
+        await security_shield.apply_tarpit()
+        headers = {"Retry-After": str(retry_after)} if retry_after else None
+        raise HTTPException(403, block_reason, headers=headers)
+
+    if not security_shield.verify_referrer_origin(request):
+        await security_shield.apply_tarpit()
+        raise HTTPException(403, "Direct hotlinking is prohibited")
+
     query = select(Media).options(selectinload(Media.episodes)).where(Media.id == media_id)
     res = await db.execute(query)
     media = res.scalars().first()
