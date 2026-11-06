@@ -566,7 +566,10 @@ class AnimeService:
         next_episode = item.get("next_airing_episode")
         max_custom = max(custom_map.keys(), default=0)
         released = next_episode - 1 if next_episode else (total if item.get("status") == "FINISHED" else max(source, default=0))
-        count = max(total, released, max(source, default=0), max_custom)
+        if total > 0:
+            count = max(total, max_custom)
+        else:
+            count = max(released, max(source, default=0), max_custom)
         if not count and item.get("media_type") == "MOVIE":
             count = 1
         episodes = []

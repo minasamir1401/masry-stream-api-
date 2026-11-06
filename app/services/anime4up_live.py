@@ -83,9 +83,11 @@ async def episode_index(client, id_mal, english, romaji):
         for url in ranked[:5]:
             response = await client.get(url, timeout=7)
             response.raise_for_status()
-            is_mal_match = bool(id_mal and re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", response.text))
-            is_title_match = re.sub(r"\W+", "", candidates[url].casefold()) in expected
-            if not is_mal_match and not is_title_match:
+            mal_ids_on_page = re.findall(r"myanimelist\.net/anime/(\d+)", response.text)
+            if id_mal and mal_ids_on_page:
+                if str(id_mal) not in mal_ids_on_page:
+                    continue
+            elif re.sub(r"\W+", "", candidates[url].casefold()) not in expected:
                 continue
             episodes = episode_links(response.text, str(response.url))
             if episodes:

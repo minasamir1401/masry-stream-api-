@@ -58,9 +58,11 @@ async def get_anime4up_episodes(client: httpx.AsyncClient, id_mal: int | None, e
         try:
             resp = await client.get(url, timeout=7, follow_redirects=True)
             if resp.status_code == 200:
-                is_mal_match = bool(id_mal and re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", resp.text))
-                is_title_match = s in resp.url.path
-                if not is_mal_match and not is_title_match:
+                mal_ids_on_page = re.findall(r"myanimelist\.net/anime/(\d+)", resp.text)
+                if id_mal and mal_ids_on_page:
+                    if str(id_mal) not in mal_ids_on_page:
+                        continue
+                elif not (s in resp.url.path):
                     continue
                 match = re.search(r'\[\{"url":"/episode/[^"]+",.*?"title":[^}]+\}\]', resp.text)
                 if match:

@@ -110,9 +110,11 @@ async def get_episode_index(client, id_mal, english, romaji):
         try:
             response = await client.get(candidate["url"])
             response.raise_for_status()
-            is_mal_match = bool(id_mal and re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", response.text))
-            is_title_match = any(re.sub(r"\W+", "", str(candidate.get(key, "")).casefold()) in expected for key in ("en", "title"))
-            if not is_mal_match and not is_title_match:
+            mal_ids_on_page = re.findall(r"myanimelist\.net/anime/(\d+)", response.text)
+            if id_mal and mal_ids_on_page:
+                if str(id_mal) not in mal_ids_on_page:
+                    continue
+            elif not any(re.sub(r"\W+", "", str(candidate.get(key, "")).casefold()) in expected for key in ("en", "title")):
                 continue
             episodes = page_episode_index(response.text)
             _episode_indexes[cache_key] = (time.monotonic() + 600, episodes)
@@ -565,9 +567,11 @@ async def resolve_servers(client, id_mal, english, romaji, episode):
             response.raise_for_status()
         except httpx.HTTPError:
             continue
-        is_mal_match = bool(id_mal and re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", response.text))
-        is_title_match = any(re.sub(r"\W+", "", str(candidate.get(key, "")).casefold()) in title_keys for key in ("en", "title"))
-        if not is_mal_match and not is_title_match:
+        mal_ids_on_page = re.findall(r"myanimelist\.net/anime/(\d+)", response.text)
+        if id_mal and mal_ids_on_page:
+            if str(id_mal) not in mal_ids_on_page:
+                continue
+        elif not any(re.sub(r"\W+", "", str(candidate.get(key, "")).casefold()) in title_keys for key in ("en", "title")):
             continue
         page = SourcePage(response.text)
         _episode_indexes[cache_key] = (time.monotonic() + 600, page_episode_index(response.text))
