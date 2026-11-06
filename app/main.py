@@ -95,7 +95,7 @@ async def add_cache_headers(request, call_next):
         and (request.url.path.startswith("/api/anime/") or request.url.path.startswith("/api/movies"))
         and not request.url.path.startswith("/api/admin/")
     ):
-        if response.status_code >= 400 or any(part in request.url.path for part in ("/stream", "/subtitles/", "/video/", "/hls/")):
+        if response.status_code >= 400 or any(part in request.url.path for part in ("/stream", "/subtitles/", "/video/")):
             response.headers["Cache-Control"] = "no-store"
         elif "Cache-Control" not in response.headers:
             response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=60"

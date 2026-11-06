@@ -1,6 +1,7 @@
 """Relay only playlist-discovered HLS assets through the site's own origin with security enforcement."""
 import hashlib
 import re
+import time
 from typing import Optional
 from urllib.parse import urljoin, urlsplit
 
@@ -13,6 +14,23 @@ from app.services.db_cache import db_cache
 from app.services.playback_sources import playback_sources
 from app.services.security_shield import security_shield
 from app.services.video_http import get_video_client
+
+
+_MEM_ASSET_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def remember_assets(assets: dict[str, str], ttl: int = 14400) -> None:
+    now = time.time()
+    exp = now + ttl
+    if len(_MEM_ASSET_CACHE) > 100000:
+        to_delete = [k for k, v in _MEM_ASSET_CACHE.items() if now > v[0]]
+        for k in to_delete[:20000]:
+            _MEM_ASSET_CACHE.pop(k, None)
+        if len(_MEM_ASSET_CACHE) > 100000:
+            for k in list(_MEM_ASSET_CACHE.keys())[:20000]:
+                _MEM_ASSET_CACHE.pop(k, None)
+    for k, v in assets.items():
+        _MEM_ASSET_CACHE[k] = (exp, v)
 
 
 def trusted_media(url: str) -> bool:
@@ -97,7 +115,19 @@ async def relay(
     if not selected or selected.get("type") != "hls":
         raise HTTPException(404, "مصدر الفيديو غير متاح")
 
-    url = await db_cache.get(f"hls-asset:{source}:{asset}") if asset else selected["url"]
+    url = None
+    if asset:
+        cache_key = f"hls-asset:{source}:{asset}"
+        entry = _MEM_ASSET_CACHE.get(cache_key)
+        if entry and entry[0] > time.time():
+            url = entry[1]
+        else:
+            url = await db_cache.get(cache_key)
+            if url:
+                _MEM_ASSET_CACHE[cache_key] = (time.time() + 14400, url)
+    else:
+        url = selected["url"]
+
     if not isinstance(url, str) or not trusted_media(url):
         raise HTTPException(404, "جزء الفيديو غير متاح")
 
@@ -130,12 +160,13 @@ async def relay(
                 client_ip=client_ip,
                 user_agent=user_agent,
             )
+            remember_assets(assets)
             await db_cache.set_many(assets, playback_sources.TTL)
             return Response(
                 text,
                 media_type="application/vnd.apple.mpegurl",
                 headers={
-                    "Cache-Control": "no-store",
+                    "Cache-Control": "no-cache, no-store",
                     "X-Content-Type-Options": "nosniff",
                 },
             )
@@ -146,7 +177,7 @@ async def relay(
 
     async def chunks():
         try:
-            async for chunk in upstream.aiter_bytes(64 * 1024):
+            async for chunk in upstream.aiter_bytes(256 * 1024):
                 yield chunk
         finally:
             await upstream.aclose()
@@ -157,7 +188,7 @@ async def relay(
         if key in upstream.headers
     }
     result_headers.update({
-        "Cache-Control": "no-store",
+        "Cache-Control": "public, max-age=86400, immutable" if asset else "no-cache",
         "Content-Encoding": "identity",
         "X-Content-Type-Options": "nosniff",
     })
