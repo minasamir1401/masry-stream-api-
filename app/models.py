@@ -175,6 +175,10 @@ class VisitorSession(Base):
     total_anime_played: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_watch_seconds: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    is_banned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    ban_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    requires_challenge: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    challenge_solved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AnalyticsEvent(Base):

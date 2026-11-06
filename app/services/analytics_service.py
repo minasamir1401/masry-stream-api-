@@ -5,6 +5,7 @@ from sqlalchemy import delete, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AnalyticsEvent, VisitorSession
+from app.services.security_shield import security_shield
 
 
 def clean_anime_title(title: Optional[str]) -> Optional[str]:
@@ -183,8 +184,18 @@ async def record_tracking_event(
         )
         db.add(event)
 
+    if getattr(visitor, "is_banned", False):
+        security_shield.set_visitor_ban(visitor_id, True)
+    if getattr(visitor, "requires_challenge", False):
+        security_shield.set_visitor_challenge(visitor_id, True)
+
     await db.commit()
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "is_banned": bool(getattr(visitor, "is_banned", False)),
+        "ban_reason": getattr(visitor, "ban_reason", None) or "تم حظر هذا الجهاز من قبل إدارة الموقع",
+        "requires_challenge": bool(getattr(visitor, "requires_challenge", False)),
+    }
 
 
 async def get_analytics_summary(days: int, db: AsyncSession) -> Dict[str, Any]:
@@ -388,6 +399,9 @@ async def get_analytics_summary(days: int, db: AsyncSession) -> Dict[str, Any]:
             "primary_anime": primary_anime,
             "animes_list": animes_list,
             "actions_summary": actions_summary,
+            "is_banned": bool(getattr(v, "is_banned", False)),
+            "ban_reason": getattr(v, "ban_reason", None),
+            "requires_challenge": bool(getattr(v, "requires_challenge", False)),
             "recent_actions": [
                 {
                     "id": ev.id,
@@ -538,6 +552,71 @@ async def get_visitor_detail(visitor_id: str, db: AsyncSession) -> Optional[Dict
         "anime_played": visitor.total_anime_played,
         "last_path": visitor.last_path or "/",
         "device": format_user_agent(visitor.user_agent),
+        "is_banned": bool(getattr(visitor, "is_banned", False)),
+        "ban_reason": getattr(visitor, "ban_reason", None),
+        "requires_challenge": bool(getattr(visitor, "requires_challenge", False)),
         "animes": animes_list,
         "timeline": timeline,
     }
+
+
+async def ban_visitor(visitor_id: str, reason: Optional[str], db: AsyncSession) -> Dict[str, Any]:
+    res = await db.execute(select(VisitorSession).where(VisitorSession.visitor_id == visitor_id))
+    visitor = res.scalar_one_or_none()
+    if visitor is None:
+        visitor = VisitorSession(
+            visitor_id=visitor_id,
+            is_banned=True,
+            ban_reason=reason or "تم الحظر بواسطة الإدارة",
+        )
+        db.add(visitor)
+    else:
+        visitor.is_banned = True
+        visitor.ban_reason = reason or "تم الحظر بواسطة الإدارة"
+    await db.commit()
+    security_shield.set_visitor_ban(visitor_id, True)
+    return {"status": "banned", "visitor_id": visitor_id}
+
+
+async def unban_visitor(visitor_id: str, db: AsyncSession) -> Dict[str, Any]:
+    res = await db.execute(select(VisitorSession).where(VisitorSession.visitor_id == visitor_id))
+    visitor = res.scalar_one_or_none()
+    if visitor:
+        visitor.is_banned = False
+        visitor.ban_reason = None
+        await db.commit()
+    security_shield.set_visitor_ban(visitor_id, False)
+    return {"status": "unbanned", "visitor_id": visitor_id}
+
+
+async def set_visitor_challenge(visitor_id: str, required: bool, db: AsyncSession) -> Dict[str, Any]:
+    res = await db.execute(select(VisitorSession).where(VisitorSession.visitor_id == visitor_id))
+    visitor = res.scalar_one_or_none()
+    if visitor is None and required:
+        visitor = VisitorSession(
+            visitor_id=visitor_id,
+            requires_challenge=True,
+        )
+        db.add(visitor)
+    elif visitor:
+        visitor.requires_challenge = required
+        if not required:
+            visitor.challenge_solved_at = datetime.now(timezone.utc)
+    await db.commit()
+    security_shield.set_visitor_challenge(visitor_id, required)
+    return {"status": "ok", "requires_challenge": required, "visitor_id": visitor_id}
+
+
+async def verify_visitor_challenge(visitor_id: str, answer: int, token: str, db: AsyncSession) -> Tuple[bool, str]:
+    is_valid, error = security_shield.verify_math_challenge(visitor_id, answer, token)
+    if not is_valid:
+        return False, error
+
+    res = await db.execute(select(VisitorSession).where(VisitorSession.visitor_id == visitor_id))
+    visitor = res.scalar_one_or_none()
+    if visitor:
+        visitor.requires_challenge = False
+        visitor.challenge_solved_at = datetime.now(timezone.utc)
+        await db.commit()
+    security_shield.set_visitor_challenge(visitor_id, False)
+    return True, "تم التحقق بنجاح"

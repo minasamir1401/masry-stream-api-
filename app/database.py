@@ -70,14 +70,24 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 def _initialize_schema(conn):
     Base.metadata.create_all(conn)
-    for table, column, definition in (
+    is_pg = conn.dialect.name == "postgresql"
+    tz_type = "TIMESTAMP WITH TIME ZONE" if is_pg else "DATETIME"
+    columns_to_ensure = (
         ("media", "telegram_watch_url", "VARCHAR(512)"),
         ("scrape_logs", "source", "VARCHAR(16)"),
-    ):
-        if conn.dialect.name == "postgresql":
-            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}"))
-        elif column not in {field["name"] for field in inspect(conn).get_columns(table)}:
-            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}"))
+        ("visitor_sessions", "is_banned", "BOOLEAN DEFAULT FALSE"),
+        ("visitor_sessions", "ban_reason", "VARCHAR(255)"),
+        ("visitor_sessions", "requires_challenge", "BOOLEAN DEFAULT FALSE"),
+        ("visitor_sessions", "challenge_solved_at", tz_type),
+    )
+    for table, column, definition in columns_to_ensure:
+        try:
+            if is_pg:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}"))
+            elif column not in {field["name"] for field in inspect(conn).get_columns(table)}:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}"))
+        except Exception as e:
+            logger.debug(f"Schema column check ignored for {table}.{column}: {e}")
 
 
 async def init_db():

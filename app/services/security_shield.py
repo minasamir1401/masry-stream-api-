@@ -2,7 +2,9 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import random
 import re
+import secrets
 import time
 from typing import Optional, Tuple
 from urllib.parse import urlsplit
@@ -50,6 +52,83 @@ class SecurityShield:
         self.secret_key = settings.SECURITY_SIGNING_KEY.encode("utf-8")
         self._session_records: dict[str, dict] = {}
         self._last_session_purge: float = time.time()
+        self._banned_visitors: set[str] = set()
+        self._challenged_visitors: set[str] = set()
+        self._banned_ips: set[str] = set()
+
+    def set_visitor_ban(self, visitor_id: str, banned: bool, ip: Optional[str] = None):
+        if banned:
+            self._banned_visitors.add(visitor_id)
+            if ip:
+                self._banned_ips.add(ip)
+        else:
+            self._banned_visitors.discard(visitor_id)
+            if ip:
+                self._banned_ips.discard(ip)
+
+    def set_visitor_challenge(self, visitor_id: str, challenged: bool):
+        if challenged:
+            self._challenged_visitors.add(visitor_id)
+        else:
+            self._challenged_visitors.discard(visitor_id)
+
+    def is_visitor_banned(self, visitor_id: Optional[str], client_ip: Optional[str] = None) -> bool:
+        if visitor_id and visitor_id in self._banned_visitors:
+            return True
+        if client_ip and client_ip in self._banned_ips:
+            return True
+        return False
+
+    def is_visitor_challenged(self, visitor_id: Optional[str]) -> bool:
+        if visitor_id and visitor_id in self._challenged_visitors:
+            return True
+        return False
+
+    def generate_math_challenge(self, visitor_id: str) -> dict:
+        num1 = random.randint(3, 25)
+        num2 = random.randint(2, 20)
+        answer = num1 + num2
+        expires_at = int(time.time()) + 600
+        nonce = secrets.token_hex(4)
+        payload = f"{visitor_id}:{answer}:{expires_at}:{nonce}"
+        sig = hmac.new(self.secret_key, payload.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+        token = f"{num1}.{num2}.{expires_at}.{nonce}.{sig}"
+        return {
+            "question": f"ما هو ناتج: {num1} + {num2} ؟",
+            "num1": num1,
+            "num2": num2,
+            "operator": "+",
+            "token": token,
+        }
+
+    def verify_math_challenge(self, visitor_id: str, answer: int, token: str) -> Tuple[bool, str]:
+        if not token:
+            return False, "رمز التحقق مفقود"
+        parts = token.split(".")
+        if len(parts) != 5:
+            return False, "رمز التحقق غير صالح"
+        try:
+            num1 = int(parts[0])
+            num2 = int(parts[1])
+            expires_at = int(parts[2])
+            nonce = parts[3]
+            sig = parts[4]
+        except ValueError:
+            return False, "صيغة رمز التحقق غير صحيحة"
+
+        if time.time() > expires_at:
+            return False, "انتهت صلاحية سؤال التحقق، يرجى تحديث المسألة"
+
+        expected_answer = num1 + num2
+        if answer != expected_answer:
+            return False, "الإجابة غير صحيحة، يرجى إعادة المحاولة"
+
+        payload = f"{visitor_id}:{expected_answer}:{expires_at}:{nonce}"
+        expected_sig = hmac.new(self.secret_key, payload.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+        if not hmac.compare_digest(sig, expected_sig):
+            return False, "توقيع التحقق غير صالح"
+
+        return True, ""
 
     def check_consecutive_session(self, client_ip: str) -> Tuple[bool, str, int]:
         now = time.time()
@@ -109,11 +188,32 @@ class SecurityShield:
             return False
         return any(pattern.search(ua) for pattern in SEARCH_ENGINE_BOT_PATTERNS)
 
+    def get_visitor_id(self, request: Request) -> Optional[str]:
+        vid = request.headers.get("x-visitor-id")
+        if vid:
+            return vid.strip()
+        vid = request.query_params.get("vid")
+        if vid:
+            return vid.strip()
+        vid = request.cookies.get("masry_vid")
+        if vid:
+            return vid.strip()
+        return None
+
     def validate_request_access(self, request: Request) -> Tuple[bool, str, int]:
         if self.is_search_engine_bot(request):
             return False, "", 0
 
         client_ip = self.get_client_ip(request)
+        visitor_id = self.get_visitor_id(request)
+
+        # 0. Enforce explicit visitor / IP ban
+        if self.is_visitor_banned(visitor_id, client_ip):
+            return True, "تم حظر هذا الجهاز من قبل إدارة الموقع", 0
+
+        # Enforce pending security challenge
+        if self.is_visitor_challenged(visitor_id):
+            return True, "يرجى حل مسألة التحقق الأمني لمتابعة استخدام المنصة", 0
 
         # 1. Enforce continuous 10-hour limit (intermittent usage is allowed)
         is_locked, lock_reason, retry_after = self.check_consecutive_session(client_ip)

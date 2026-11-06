@@ -55,6 +55,10 @@ class UpdateReportRequest(BaseModel):
     admin_notes: Optional[str] = None
 
 
+class VisitorBanRequest(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=255)
+
+
 
 @router.post("/login")
 async def login(
@@ -144,6 +148,44 @@ async def cleanup_admin(
     db: AsyncSession = Depends(get_db),
 ):
     return await analytics_service.cleanup_admin_sessions(db)
+
+
+@router.post("/visitors/{visitor_id}/ban")
+async def admin_ban_visitor(
+    visitor_id: str,
+    body: Optional[VisitorBanRequest] = None,
+    _: str = Depends(admin_auth.require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    reason = body.reason if body else None
+    return await analytics_service.ban_visitor(visitor_id=visitor_id, reason=reason, db=db)
+
+
+@router.post("/visitors/{visitor_id}/unban")
+async def admin_unban_visitor(
+    visitor_id: str,
+    _: str = Depends(admin_auth.require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    return await analytics_service.unban_visitor(visitor_id=visitor_id, db=db)
+
+
+@router.post("/visitors/{visitor_id}/challenge")
+async def admin_challenge_visitor(
+    visitor_id: str,
+    _: str = Depends(admin_auth.require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    return await analytics_service.set_visitor_challenge(visitor_id=visitor_id, required=True, db=db)
+
+
+@router.post("/visitors/{visitor_id}/unchallenge")
+async def admin_unchallenge_visitor(
+    visitor_id: str,
+    _: str = Depends(admin_auth.require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    return await analytics_service.set_visitor_challenge(visitor_id=visitor_id, required=False, db=db)
 
 
 @router.get("/reports")
