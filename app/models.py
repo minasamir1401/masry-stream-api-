@@ -243,3 +243,61 @@ class CustomServer(Base):
     )
 
 
+class Report(Base):
+    __tablename__ = "reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    category: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    details: Mapped[str] = mapped_column(Text, nullable=False)
+    anime_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    episode_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    contact_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
+    admin_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    visitor_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    ip_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now(), nullable=True
+    )
+
+
+class EpisodeComment(Base):
+    __tablename__ = "episode_comments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    media_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    episode_number: Mapped[int] = mapped_column(Integer, default=1, nullable=False, index=True)
+    author_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    visitor_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    parent_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("episode_comments.id", ondelete="CASCADE"), nullable=True
+    )
+    is_approved: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    likes_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+
+class EpisodeRating(Base):
+    __tablename__ = "episode_ratings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    media_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    episode_number: Mapped[int] = mapped_column(Integer, default=1, nullable=False, index=True)
+    visitor_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    score: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("media_id", "episode_number", "visitor_id", name="uq_episode_visitor_rating"),
+    )
+
+

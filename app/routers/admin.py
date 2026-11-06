@@ -1,9 +1,11 @@
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, SecretStr
+from sqlalchemy import delete, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.models import Report, EpisodeComment
 from app.services import admin_auth, analytics_service
 from app.services.db_cache import db_cache
 from app.services.anime_override_service import anime_override_service
@@ -14,6 +16,7 @@ router = APIRouter(prefix="/api/admin", tags=["Administration"], include_in_sche
 class AdminLoginRequest(BaseModel):
     username: str = Field(..., min_length=2, max_length=64)
     password: SecretStr
+    visitor_id: Optional[str] = None
 
 
 class ChangeCredentialsRequest(BaseModel):
@@ -47,6 +50,11 @@ class CustomServerUpdateRequest(BaseModel):
     is_active: bool = True
 
 
+class UpdateReportRequest(BaseModel):
+    status: Optional[str] = Field(default=None, pattern="^(pending|in_progress|resolved|dismissed)$")
+    admin_notes: Optional[str] = None
+
+
 
 @router.post("/login")
 async def login(
@@ -65,6 +73,9 @@ async def login(
         response=response,
         db=db,
     )
+    if body.visitor_id:
+        await analytics_service.cleanup_visitor_id(body.visitor_id, db)
+        await analytics_service.cleanup_admin_sessions(db, [body.visitor_id])
     return {"status": "authenticated", "username": username}
 
 
@@ -113,6 +124,162 @@ async def analytics_overview(
     db: AsyncSession = Depends(get_db),
 ):
     return await analytics_service.get_analytics_summary(days=days, db=db)
+
+
+@router.get("/analytics/visitor/{visitor_id}")
+async def visitor_detail(
+    visitor_id: str,
+    _: str = Depends(admin_auth.require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    detail = await analytics_service.get_visitor_detail(visitor_id=visitor_id, db=db)
+    if detail is None:
+        raise HTTPException(404, "لم يتم العثور على سجل لهذا الزائر")
+    return detail
+
+
+@router.post("/analytics/cleanup-admin")
+async def cleanup_admin(
+    _: str = Depends(admin_auth.require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    return await analytics_service.cleanup_admin_sessions(db)
+
+
+@router.get("/reports")
+async def list_reports(
+    category: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    _: str = Depends(admin_auth.require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(Report).order_by(desc(Report.created_at)).limit(limit)
+    if category:
+        query = query.where(Report.category == category)
+    if status:
+        query = query.where(Report.status == status)
+
+    res = await db.execute(query)
+    reports = res.scalars().all()
+    return {
+        "total": len(reports),
+        "items": [
+            {
+                "id": r.id,
+                "category": r.category,
+                "title": r.title,
+                "details": r.details,
+                "anime_id": r.anime_id,
+                "episode_number": r.episode_number,
+                "contact_email": r.contact_email,
+                "status": r.status,
+                "admin_notes": r.admin_notes,
+                "visitor_id": r.visitor_id,
+                "created_at": r.created_at.isoformat() if r.created_at else "",
+                "updated_at": r.updated_at.isoformat() if r.updated_at else "",
+            }
+            for r in reports
+        ],
+    }
+
+
+@router.patch("/reports/{report_id}")
+async def update_report(
+    report_id: int,
+    body: UpdateReportRequest,
+    _: str = Depends(admin_auth.require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(Report).where(Report.id == report_id))
+    report = res.scalar_one_or_none()
+    if report is None:
+        raise HTTPException(404, "البلاغ غير موجود")
+
+    if body.status:
+        report.status = body.status
+    if body.admin_notes is not None:
+        report.admin_notes = body.admin_notes
+
+    await db.commit()
+    await db.refresh(report)
+    return {"status": "success", "report_id": report.id, "new_status": report.status}
+
+
+@router.delete("/reports/{report_id}")
+async def delete_report(
+    report_id: int,
+    _: str = Depends(admin_auth.require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(Report).where(Report.id == report_id))
+    report = res.scalar_one_or_none()
+    if report is None:
+        raise HTTPException(404, "البلاغ غير موجود")
+
+    await db.delete(report)
+    await db.commit()
+    return {"status": "deleted", "report_id": report_id}
+
+
+@router.get("/comments")
+async def list_admin_comments(
+    limit: int = Query(default=50, ge=1, le=200),
+    _: str = Depends(admin_auth.require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(EpisodeComment).order_by(desc(EpisodeComment.created_at)).limit(limit)
+    res = await db.execute(query)
+    comments = res.scalars().all()
+    return {
+        "total": len(comments),
+        "items": [
+            {
+                "id": c.id,
+                "media_id": c.media_id,
+                "episode_number": c.episode_number,
+                "author_name": c.author_name,
+                "content": c.content,
+                "visitor_id": c.visitor_id,
+                "likes_count": c.likes_count,
+                "is_approved": c.is_approved,
+                "created_at": c.created_at.isoformat() if c.created_at else "",
+            }
+            for c in comments
+        ],
+    }
+
+
+@router.delete("/comments/{comment_id}")
+async def delete_admin_comment(
+    comment_id: int,
+    _: str = Depends(admin_auth.require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(EpisodeComment).where(EpisodeComment.id == comment_id))
+    comment = res.scalar_one_or_none()
+    if comment is None:
+        raise HTTPException(404, "التعليق غير موجود")
+
+    await db.delete(comment)
+    await db.commit()
+    return {"status": "deleted", "comment_id": comment_id}
+
+
+@router.patch("/comments/{comment_id}/toggle-approval")
+async def toggle_admin_comment_approval(
+    comment_id: int,
+    _: str = Depends(admin_auth.require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(EpisodeComment).where(EpisodeComment.id == comment_id))
+    comment = res.scalar_one_or_none()
+    if comment is None:
+        raise HTTPException(404, "التعليق غير موجود")
+
+    comment.is_approved = not comment.is_approved
+    await db.commit()
+    return {"status": "success", "comment_id": comment_id, "is_approved": comment.is_approved}
 
 
 @router.post("/cache/purge")

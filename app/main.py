@@ -7,7 +7,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 from app.config import settings
 from app.database import AsyncSessionLocal, init_db
-from app.routers import admin, analytics, anime, genres, media, stream
+from app.routers import admin, analytics, anime, community, genres, media, stream
 from app.services.admin_auth import ensure_default_admin
 from app.services.db_cache import db_cache
 from app.services.video_http import close_video_client
@@ -74,6 +74,7 @@ app.include_router(anime.router)
 app.include_router(stream.router)
 app.include_router(genres.router)
 app.include_router(analytics.router)
+app.include_router(community.router)
 app.include_router(admin.router)
 
 

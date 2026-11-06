@@ -89,6 +89,16 @@ def check_admin_origin(request: Request):
         raise HTTPException(403, "افتح لوحة الإدارة من رابط الموقع المسموح")
 
 
+def is_valid_admin_token(token: Optional[str]) -> bool:
+    if not token or token not in sessions:
+        return False
+    session_data = sessions[token]
+    if session_data.get("expiry", 0) <= monotonic():
+        sessions.pop(token, None)
+        return False
+    return True
+
+
 def require_admin(request: Request) -> str:
     check_admin_origin(request)
     token = request.cookies.get(COOKIE_NAME)

@@ -82,6 +82,7 @@ def _initialize_schema(conn):
 
 async def init_db():
     global engine, AsyncSessionLocal
+    import app.models
     try:
         async with engine.begin() as conn:
             await conn.run_sync(_initialize_schema)

@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.services import analytics_service
+from app.services import admin_auth, analytics_service
 
 router = APIRouter(prefix="/api/analytics", tags=["Analytics"])
 
@@ -26,6 +26,12 @@ async def track_event(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    if body.path.startswith("/admin") or body.path == "/admin":
+        return {"status": "ignored", "reason": "admin_path"}
+
+    admin_token = request.cookies.get(admin_auth.COOKIE_NAME)
+    if admin_token and admin_auth.is_valid_admin_token(admin_token):
+        return {"status": "ignored", "reason": "admin_session"}
     ip = request.client.host if request.client else ""
     ip_hash = hashlib.sha256(ip.encode("utf-8")).hexdigest()[:16] if ip else None
     user_agent = request.headers.get("user-agent", "")
