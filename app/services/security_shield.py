@@ -29,6 +29,21 @@ BOT_USER_AGENT_PATTERNS = [
     re.compile(r"postmanruntime", re.IGNORECASE),
 ]
 
+SEARCH_ENGINE_BOT_PATTERNS = [
+    re.compile(r"googlebot", re.IGNORECASE),
+    re.compile(r"google-inspectiontool", re.IGNORECASE),
+    re.compile(r"mediapartners-google", re.IGNORECASE),
+    re.compile(r"adsbot-google", re.IGNORECASE),
+    re.compile(r"bingbot", re.IGNORECASE),
+    re.compile(r"yandexbot", re.IGNORECASE),
+    re.compile(r"duckduckbot", re.IGNORECASE),
+    re.compile(r"baiduspider", re.IGNORECASE),
+    re.compile(r"twitterbot", re.IGNORECASE),
+    re.compile(r"facebookexternalhit", re.IGNORECASE),
+    re.compile(r"applebot", re.IGNORECASE),
+    re.compile(r"linkedinbot", re.IGNORECASE),
+]
+
 
 class SecurityShield:
     def __init__(self):
@@ -88,7 +103,16 @@ class SecurityShield:
         }
         return False, "", 0
 
+    def is_search_engine_bot(self, request: Request) -> bool:
+        ua = request.headers.get("user-agent", "").strip()
+        if not ua:
+            return False
+        return any(pattern.search(ua) for pattern in SEARCH_ENGINE_BOT_PATTERNS)
+
     def validate_request_access(self, request: Request) -> Tuple[bool, str, int]:
+        if self.is_search_engine_bot(request):
+            return False, "", 0
+
         client_ip = self.get_client_ip(request)
 
         # 1. Enforce continuous 10-hour limit (intermittent usage is allowed)
@@ -128,6 +152,9 @@ class SecurityShield:
         if not settings.ENABLE_ANTI_BOT:
             return False, ""
 
+        if self.is_search_engine_bot(request):
+            return False, ""
+
         user_agent = request.headers.get("user-agent", "").strip()
         if not user_agent:
             return True, "Missing User-Agent header"
@@ -145,6 +172,9 @@ class SecurityShield:
 
     def verify_referrer_origin(self, request: Request) -> bool:
         if not settings.ENABLE_ANTI_BOT:
+            return True
+
+        if self.is_search_engine_bot(request):
             return True
 
         referer = request.headers.get("referer")
