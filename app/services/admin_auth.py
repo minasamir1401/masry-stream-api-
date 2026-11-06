@@ -1,10 +1,11 @@
 import hashlib
+import hmac
 import math
 import os
 import secrets
+import time
 from collections import deque
 from pathlib import Path
-from time import monotonic
 from typing import Optional, Tuple
 
 from fastapi import HTTPException, Request, Response
@@ -15,8 +16,9 @@ from app.config import settings
 from app.models import AdminUser
 
 COOKIE_NAME = "masry_admin"
-SESSION_SECONDS = 12 * 60 * 60
-sessions: dict[str, dict] = {}
+SESSION_SECONDS = 7 * 24 * 60 * 60  # 7 days
+revoked_tokens: set[str] = set()
+legacy_sessions: dict[str, dict] = {}
 login_failures: deque[float] = deque()
 
 
@@ -89,27 +91,79 @@ def check_admin_origin(request: Request):
         raise HTTPException(403, "افتح لوحة الإدارة من رابط الموقع المسموح")
 
 
+def create_signed_token(username: str, ttl: int = SESSION_SECONDS) -> str:
+    issued_at = int(time.time())
+    expires_at = issued_at + ttl
+    key = settings.SECURITY_SIGNING_KEY.encode("utf-8")
+    payload = f"{username}|{issued_at}|{expires_at}"
+    signature = hmac.new(key, payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    return f"{username}.{issued_at}.{expires_at}.{signature}"
+
+
+def verify_signed_token(token: Optional[str]) -> Optional[str]:
+    if not token or token in revoked_tokens:
+        return None
+
+    parts = token.split(".")
+    if len(parts) == 4:
+        username, issued_str, expires_str, signature = parts
+        try:
+            expires_at = int(expires_str)
+            issued_at = int(issued_str)
+        except ValueError:
+            return None
+
+        if time.time() > expires_at:
+            return None
+
+        key = settings.SECURITY_SIGNING_KEY.encode("utf-8")
+        payload = f"{username}|{issued_at}|{expires_at}"
+        expected_sig = hmac.new(key, payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+        if hmac.compare_digest(signature, expected_sig):
+            return username
+
+    # Legacy in-memory session check for backwards compatibility
+    if token in legacy_sessions:
+        data = legacy_sessions[token]
+        if data.get("expiry", 0) > time.time():
+            return data.get("username", "admin")
+        legacy_sessions.pop(token, None)
+
+    return None
+
+
+def extract_token_from_request(request: Request) -> Optional[str]:
+    token = request.cookies.get(COOKIE_NAME)
+    if token:
+        return token
+
+    header_token = request.headers.get("x-admin-token")
+    if header_token:
+        return header_token.strip()
+
+    auth = request.headers.get("authorization")
+    if auth and auth.startswith("Bearer "):
+        return auth[7:].strip()
+
+    return None
+
+
 def is_valid_admin_token(token: Optional[str]) -> bool:
-    if not token or token not in sessions:
-        return False
-    session_data = sessions[token]
-    if session_data.get("expiry", 0) <= monotonic():
-        sessions.pop(token, None)
-        return False
-    return True
+    return verify_signed_token(token) is not None
 
 
 def require_admin(request: Request) -> str:
     check_admin_origin(request)
-    token = request.cookies.get(COOKIE_NAME)
-    now = monotonic()
-    if not token or token not in sessions:
+    token = extract_token_from_request(request)
+    if not token:
         raise HTTPException(401, "سجّل الدخول إلى لوحة الإدارة")
-    session_data = sessions[token]
-    if session_data.get("expiry", 0) <= now:
-        sessions.pop(token, None)
+
+    username = verify_signed_token(token)
+    if not username:
         raise HTTPException(401, "انتهت الجلسة. يرجى تسجيل الدخول مجددًا")
-    return session_data.get("username", "admin")
+
+    return username
 
 
 async def login(
@@ -118,21 +172,24 @@ async def login(
     request: Request,
     response: Response,
     db: AsyncSession,
-) -> str:
+) -> Tuple[str, str]:
     check_admin_origin(request)
-    now = monotonic()
+    now = time.time()
     while login_failures and login_failures[0] <= now - 60:
         login_failures.popleft()
     if len(login_failures) >= 5:
         retry_after = max(1, math.ceil(60 - (now - login_failures[0])))
-        raise HTTPException(429, "محاولات تسجيل دخول كثيرة. انتظر قبل المحاولة مجددًا", headers={"Retry-After": str(retry_after)})
+        raise HTTPException(
+            429,
+            "محاولات تسجيل دخول كثيرة. انتظر قبل المحاولة مجددًا",
+            headers={"Retry-After": str(retry_after)},
+        )
 
     clean_user = username.strip().lower()
     result = await db.execute(select(AdminUser).where(AdminUser.username == clean_user))
     admin_user = result.scalar_one_or_none()
 
     if admin_user is None:
-        # Check if DB has any admin user; if not, initialize default admin
         all_admins = await db.execute(select(AdminUser).limit(1))
         if all_admins.scalar_one_or_none() is None:
             admin_user = await ensure_default_admin(db)
@@ -149,15 +206,8 @@ async def login(
 
     login_failures.clear()
 
-    # Expire old sessions
-    for token, data in list(sessions.items()):
-        if data.get("expiry", 0) <= now:
-            del sessions[token]
-    if len(sessions) >= 32:
-        del sessions[next(iter(sessions))]
-
-    session_token = secrets.token_urlsafe(32)
-    sessions[session_token] = {
+    session_token = create_signed_token(admin_user.username)
+    legacy_sessions[session_token] = {
         "username": admin_user.username,
         "expiry": now + SESSION_SECONDS,
     }
@@ -174,13 +224,17 @@ async def login(
         httponly=True,
         samesite="lax",
         secure=is_secure,
-        path="/api",
+        path="/",
     )
-    return admin_user.username
+    return admin_user.username, session_token
 
 
 def logout(request: Request, response: Response):
-    sessions.pop(request.cookies.get(COOKIE_NAME, ""), None)
+    token = extract_token_from_request(request)
+    if token:
+        revoked_tokens.add(token)
+        legacy_sessions.pop(token, None)
+    response.delete_cookie(COOKIE_NAME, path="/")
     response.delete_cookie(COOKIE_NAME, path="/api")
 
 

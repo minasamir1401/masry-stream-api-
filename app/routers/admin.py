@@ -66,7 +66,7 @@ async def login(
     password = body.password.get_secret_value()
     if len(password) > 1024:
         raise HTTPException(400, "كلمة المرور طويلة جدًا")
-    username = await admin_auth.login(
+    username, token = await admin_auth.login(
         username=body.username,
         password=password,
         request=request,
@@ -76,7 +76,7 @@ async def login(
     if body.visitor_id:
         await analytics_service.cleanup_visitor_id(body.visitor_id, db)
         await analytics_service.cleanup_admin_sessions(db, [body.visitor_id])
-    return {"status": "authenticated", "username": username}
+    return {"status": "authenticated", "username": username, "token": token}
 
 
 @router.post("/logout")
