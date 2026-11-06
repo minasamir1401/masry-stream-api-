@@ -23,6 +23,11 @@ UQLOAD_HOSTS = {"uqload.com", "www.uqload.com", "uqload.is", "www.uqload.is", "u
 HLS_MEDIA_SUFFIXES = (".friwduh.shop", ".s1q2105.com", ".97bf1.com", ".cloudwindow-route.com", ".tnmr.org")
 VOE_HOSTS = {"voe.sx", "shannoncoldalready.com"}
 LULUSTREAM_HOSTS = {"lulustream.com", "luluvdo.com"}
+STREAMTAPE_HOSTS = {"streamtape.com", "streamtape.to", "streamta.pe", "streamtape.net"}
+VINOVO_HOSTS = {"vinovo.to", "vinovo.pro", "vinovo.net"}
+FIRESTREAM_HOSTS = {"firestream.to", "firestream.top"}
+DOOD_HOSTS = {"dood.to", "dood.so", "dood.ws", "dood.la", "ds2play.com", "dsvplay.com"}
+MEDIAFIRE_HOSTS = {"mediafire.com", "www.mediafire.com"}
 MP4_MEDIA_SUFFIXES = (".mp4upload.com", ".krakencloud.net", ".sendvid.com", ".vid3rb.com", ".mxcontent.net")
 _episode_indexes = {}
 
@@ -75,15 +80,22 @@ def page_episode_index(markup):
 
 
 async def get_episode_index(client, id_mal, english, romaji):
-    if not id_mal:
+    cache_key = id_mal or english or romaji
+    if not cache_key:
         return {}
-    cached = _episode_indexes.get(id_mal)
+    cached = _episode_indexes.get(cache_key)
     if cached and cached[0] > time.monotonic():
         return cached[1]
-    titles = list(dict.fromkeys(title for title in (english, romaji) if title))
-    expected = {re.sub(r"\W+", "", title.casefold()) for title in titles}
+    raw_titles = [title for title in (english, romaji) if title]
+    if not raw_titles:
+        return {}
+    base_title = re.split(r"[:–—\-\|\/]", raw_titles[0])[0].strip()
+    titles = list(dict.fromkeys(raw_titles + ([base_title] if base_title else [])))
+    expected = {re.sub(r"\W+", "", title.casefold()) for title in titles if title}
     candidates = {}
     for title in titles:
+        if not title:
+            continue
         try:
             response = await client.get(f"{BASE_URL}/wp-json/animetna/v1/search", params={"q": title})
             response.raise_for_status()
@@ -98,10 +110,12 @@ async def get_episode_index(client, id_mal, english, romaji):
         try:
             response = await client.get(candidate["url"])
             response.raise_for_status()
-            if not re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", response.text):
+            is_mal_match = bool(id_mal and re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", response.text))
+            is_title_match = any(re.sub(r"\W+", "", str(candidate.get(key, "")).casefold()) in expected for key in ("en", "title"))
+            if not is_mal_match and not is_title_match:
                 continue
             episodes = page_episode_index(response.text)
-            _episode_indexes[id_mal] = (time.monotonic() + 600, episodes)
+            _episode_indexes[cache_key] = (time.monotonic() + 600, episodes)
             return episodes
         except httpx.HTTPError:
             continue
@@ -385,7 +399,19 @@ async def share4max_videos(client, url):
         return []
 
 
-SUPPORTED_EMBED_HOSTS = {"ok.ru", "mega.nz", "4shared.com", "www.4shared.com", "uptostream.com", "dsvplay.com"}
+SUPPORTED_EMBED_HOSTS = {"ok.ru", "mega.nz", "4shared.com", "www.4shared.com", "uptostream.com", "dsvplay.com"} | STREAMTAPE_HOSTS | VINOVO_HOSTS | FIRESTREAM_HOSTS | DOOD_HOSTS
+
+
+async def resolve_mediafire(client, url):
+    try:
+        response = await client.get(url, timeout=7, follow_redirects=True)
+        if response.status_code == 200:
+            match = re.search(r'href="(https?://download\d+\.mediafire\.com/[^"]+)"', response.text)
+            if match:
+                return {"name": "Mediafire FHD", "type": "direct", "url": match.group(1)}
+    except Exception:
+        pass
+    return None
 
 
 async def resolve_player(client, server, id_mal, episode):
@@ -393,6 +419,11 @@ async def resolve_player(client, server, id_mal, episode):
         result = await revalidate_server(client, server)
         return [result] if result else []
     host = urlsplit(server["url"]).hostname or ""
+    if host in MEDIAFIRE_HOSTS:
+        mf = await resolve_mediafire(client, server["url"])
+        if mf:
+            return [mf]
+        return []
     if host in SHARE4MAX_HOSTS:
         s4m = await share4max_videos(client, server["url"])
         if s4m:
@@ -416,6 +447,9 @@ async def resolve_player(client, server, id_mal, episode):
         result = await mixdrop_video(client, server["url"], server["name"])
     elif host in LULUSTREAM_HOSTS:
         result = await lulustream_video(client, server["url"], server["name"])
+    elif host in STREAMTAPE_HOSTS or host in VINOVO_HOSTS or host in FIRESTREAM_HOSTS or host in DOOD_HOSTS:
+        valid = await validate_embed(client, server)
+        return [valid] if valid else []
     elif host in UQLOAD_HOSTS:
         return []
     else:
@@ -451,25 +485,29 @@ class SourcePage(HTMLParser):
 async def validate_embed(client, server):
     url = server["url"]
     parsed = urlsplit(url)
-    host = parsed.hostname
+    host = parsed.hostname or ""
     if parsed.scheme != "https" or parsed.port not in (None, 443):
         return None
-    if host not in {"ok.ru"} | MP4UPLOAD_HOSTS | SHARE4MAX_HOSTS:
+
+    if any(h in host for h in ("uqload.", "drive.google.com")):
         return None
+
+    if any(h in host for h in ("streamtape.", "firestream.", "vinovo.", "dood.")):
+        if "/v/" in parsed.path:
+            server = {**server, "url": url.replace("/v/", "/e/")}
+            url = server["url"]
+            parsed = urlsplit(url)
+
     if host == "ok.ru" and not re.fullmatch(r"/videoembed/[0-9]+", parsed.path):
         return None
-    if host in MP4UPLOAD_HOSTS and not re.fullmatch(r"/embed-[a-z0-9]+\.html", parsed.path):
-        return None
-    if host in SHARE4MAX_HOSTS and not re.fullmatch(r"/iframe/[A-Za-z0-9]+", parsed.path):
-        return None
+
     try:
         response = await client.get(url, timeout=7, follow_redirects=True)
-        response.raise_for_status()
-    except httpx.HTTPError:
+        if response.status_code >= 400:
+            return None
+    except Exception:
         return None
-    allowed_redirects = SHARE4MAX_HOSTS if host in SHARE4MAX_HOSTS else {host}
-    if response.url.host not in allowed_redirects:
-        return None
+
     if host == "ok.ru":
         if "vp_video_stub" in response.text or "data-module=\"VideoEmbed\"" not in response.text:
             record("deleted_media", url)
@@ -482,20 +520,24 @@ async def validate_embed(client, server):
             return None
         if video.get("status") != "active" or video.get("hashId") != parsed.path.rsplit("/", 1)[-1]:
             return None
-    elif not re.search(r'player\.src\(\s*\{[^}]*src:\s*["\x27]https://', response.text, re.S):
+    elif "File was deleted" in response.text or "Video not found" in response.text:
         return None
+
     return server
 
 
 async def resolve_servers(client, id_mal, english, romaji, episode):
-    if not id_mal:
+    cache_key = id_mal or english or romaji
+    if not cache_key:
         return []
-    cached = _episode_indexes.get(id_mal)
+    cached = _episode_indexes.get(cache_key)
     if cached and cached[0] > time.monotonic() and episode in cached[1]:
         return await resolve_episode_page(client, cached[1][episode], id_mal, episode)
-    titles = [title for title in (english, romaji) if title]
-    if not titles:
+    raw_titles = [title for title in (english, romaji) if title]
+    if not raw_titles:
         return []
+    base_title = re.split(r"[:–—\-\|\/]", raw_titles[0])[0].strip()
+    titles = list(dict.fromkeys(raw_titles + ([base_title] if base_title else [])))
     queries = list(dict.fromkeys(titles + [re.split(r"\W+", titles[0])[0]]))
     candidates = {}
     for query in queries:
@@ -523,10 +565,12 @@ async def resolve_servers(client, id_mal, english, romaji, episode):
             response.raise_for_status()
         except httpx.HTTPError:
             continue
-        if not re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", response.text):
+        is_mal_match = bool(id_mal and re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", response.text))
+        is_title_match = any(re.sub(r"\W+", "", str(candidate.get(key, "")).casefold()) in title_keys for key in ("en", "title"))
+        if not is_mal_match and not is_title_match:
             continue
         page = SourcePage(response.text)
-        _episode_indexes[id_mal] = (time.monotonic() + 600, page_episode_index(response.text))
+        _episode_indexes[cache_key] = (time.monotonic() + 600, page_episode_index(response.text))
         episode_links = {}
         for url, label in page.links:
             parsed = urlsplit(url)
@@ -544,7 +588,7 @@ async def resolve_servers(client, id_mal, english, romaji, episode):
             if not number and episode == 1 and len(episode_links) == 1:
                 selected = url
         if not selected:
-            return []
+            continue
         return await resolve_episode_page(client, selected, id_mal, episode)
     return []
 

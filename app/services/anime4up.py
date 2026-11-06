@@ -31,10 +31,10 @@ def slug(text: str) -> str:
 
 
 async def get_anime4up_episodes(client: httpx.AsyncClient, id_mal: int | None, english: str | None, romaji: str | None) -> dict[int, str]:
-    if not id_mal:
+    cache_key = id_mal or english or romaji
+    if not cache_key:
         return {}
 
-    cache_key = id_mal or english or romaji
     cached = _anime_cache.get(cache_key)
     if cached and cached[0] > time.monotonic():
         return cached[1]
@@ -46,13 +46,21 @@ async def get_anime4up_episodes(client: httpx.AsyncClient, id_mal: int | None, e
         no_year = re.sub(r"\s*\(\d{4}\)", "", t).strip()
         if no_year != t:
             slugs.append(slug(no_year))
+        base = re.split(r"[:–—\-\|\/]", t)[0].strip()
+        if base and base != t:
+            slugs.append(slug(base))
+        clean = re.sub(r"\b(pilot\s*film|movie|special|season\s*\d+|part\s*\d+)\b", "", t, flags=re.I).strip()
+        if clean and clean != t:
+            slugs.append(slug(clean))
 
-    for s in dict.fromkeys(slugs):
+    for s in dict.fromkeys([x for x in slugs if x]):
         url = f"{BASE_URL}/anime/{s}/"
         try:
             resp = await client.get(url, timeout=7, follow_redirects=True)
             if resp.status_code == 200:
-                if not re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", resp.text):
+                is_mal_match = bool(id_mal and re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", resp.text))
+                is_title_match = s in resp.url.path
+                if not is_mal_match and not is_title_match:
                     continue
                 match = re.search(r'\[\{"url":"/episode/[^"]+",.*?"title":[^}]+\}\]', resp.text)
                 if match:

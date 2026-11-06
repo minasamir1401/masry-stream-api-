@@ -21,9 +21,10 @@ def slug(title):
 
 
 async def episode_index(client, id_mal, english, romaji):
-    if not id_mal:
+    cache_key = id_mal or english or romaji
+    if not cache_key:
         return {}
-    cached = _titles.get(id_mal)
+    cached = _titles.get(cache_key)
     if cached and cached[0] > time.monotonic():
         return cached[1]
     names = []
@@ -31,17 +32,25 @@ async def episode_index(client, id_mal, english, romaji):
         if not title:
             continue
         names.append(slug(title))
+        base = re.split(r"[:–—\-\|\/]", title)[0].strip()
+        if base and base != title:
+            names.append(slug(base))
+        clean = re.sub(r"\b(pilot\s*film|movie|special|season\s*\d+|part\s*\d+)\b", "", title, flags=re.I).strip()
+        if clean and clean != title:
+            names.append(slug(clean))
         numbered = re.fullmatch(r"(.+?)\s+([2-9])", title)
         if numbered:
             number = int(numbered[2])
             suffix = {2: "nd", 3: "rd"}.get(number, "th")
             names.append(slug(f"{numbered[1]} {number}{suffix} Season"))
             names.append(slug(f"{numbered[1]} Season {number}"))
-    for name in dict.fromkeys(names):
+    for name in dict.fromkeys([n for n in names if n]):
         try:
             response = await client.get(f"{BASE}/titles/{name}", timeout=8)
             response.raise_for_status()
-            if not re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", response.text):
+            is_mal_match = bool(id_mal and re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", response.text))
+            is_title_match = name in response.url.path
+            if not is_mal_match and not is_title_match:
                 continue
             episodes = {}
             for url, _ in SourcePage(response.text).links:
@@ -49,7 +58,7 @@ async def episode_index(client, id_mal, english, romaji):
                 match = re.fullmatch(r"/episode/[^/]+/([0-9]+)", parsed.path)
                 if parsed.scheme == "https" and parsed.hostname == "anime3rb.com" and match:
                     episodes[int(match[1])] = url
-            _titles[id_mal] = (time.monotonic() + 1800, episodes)
+            _titles[cache_key] = (time.monotonic() + 1800, episodes)
             return episodes
         except httpx.HTTPError:
             continue

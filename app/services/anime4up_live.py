@@ -51,22 +51,26 @@ async def origin(client):
 
 
 async def episode_index(client, id_mal, english, romaji):
-    if not id_mal:
+    cache_key = id_mal or english or romaji
+    if not cache_key:
         return {}
-    cached = _indexes.get(id_mal)
+    cached = _indexes.get(cache_key)
     if cached and cached[0] > time.monotonic():
         return cached[1]
-    saved = await db_cache.get(f"source-index:anime4up-live:{id_mal}")
+    saved = await db_cache.get(f"source-index:anime4up-live:{cache_key}")
     if saved:
         value = {int(number): url for number, url in saved.items()}
-        _indexes[id_mal] = (time.monotonic() + 3600, value)
+        _indexes[cache_key] = (time.monotonic() + 3600, value)
         return value
     try:
         base = await origin(client)
-        titles = list(dict.fromkeys(title for title in (romaji, english) if title))
-        expected = {re.sub(r"\W+", "", title.casefold()) for title in titles}
+        raw_titles = [t for t in (romaji, english) if t]
+        titles = list(dict.fromkeys(raw_titles + [re.split(r"[:–—\-\|\/]", t)[0].strip() for t in raw_titles if t]))
+        expected = {re.sub(r"\W+", "", title.casefold()) for title in titles if title}
         candidates = {}
         for title in titles:
+            if not title:
+                continue
             response = await client.get(base + "/", params={"s": title}, timeout=7)
             response.raise_for_status()
             for raw, label in SourcePage(response.text).links:
@@ -79,12 +83,14 @@ async def episode_index(client, id_mal, english, romaji):
         for url in ranked[:5]:
             response = await client.get(url, timeout=7)
             response.raise_for_status()
-            if not re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", response.text):
+            is_mal_match = bool(id_mal and re.search(rf"https?://(?:www\.)?myanimelist\.net/anime/{id_mal}(?![0-9])", response.text))
+            is_title_match = re.sub(r"\W+", "", candidates[url].casefold()) in expected
+            if not is_mal_match and not is_title_match:
                 continue
             episodes = episode_links(response.text, str(response.url))
             if episodes:
-                _indexes[id_mal] = (time.monotonic() + 3600, episodes)
-                await db_cache.set(f"source-index:anime4up-live:{id_mal}", episodes, 3600)
+                _indexes[cache_key] = (time.monotonic() + 3600, episodes)
+                await db_cache.set(f"source-index:anime4up-live:{cache_key}", episodes, 3600)
                 return episodes
     except (httpx.HTTPError, ValueError):
         pass
@@ -110,6 +116,6 @@ async def resolve_sources(client, id_mal, english, romaji, episode):
             if host in DIRECT_PLAYER_HOSTS | SHARE4MAX_HOSTS | VOE_HOSTS | MIXDROP_HOSTS | VIDARA_HOSTS or is_anime4up_host(host):
                 options.append({"name": (host or "").removeprefix("www."), "type": "embed", "url": link})
         results = await collect_available((resolve_player(client, option, id_mal, episode) for option in options))
-        return [server for group in results if isinstance(group, list) for server in group if server.get("type") in ("direct", "hls")]
+        return [server for group in results if isinstance(group, list) for server in group if server.get("type") in ("direct", "hls", "embed")]
     except (httpx.HTTPError, ValueError, TypeError):
         return []

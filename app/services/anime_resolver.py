@@ -7,7 +7,9 @@ import urllib.parse
 from typing import Any, Dict, List, Optional
 import httpx
 from app.services.animetna import (resolve_servers, validate_embed, revalidate_server, resolve_player,
-    DIRECT_PLAYER_HOSTS, SHARE4MAX_HOSTS, VIDARA_HOSTS, UQLOAD_HOSTS, VOE_HOSTS, MIXDROP_HOSTS, HLS_MEDIA_SUFFIXES, is_anime4up_host)
+    DIRECT_PLAYER_HOSTS, SHARE4MAX_HOSTS, VIDARA_HOSTS, UQLOAD_HOSTS, VOE_HOSTS, MIXDROP_HOSTS,
+    STREAMTAPE_HOSTS, VINOVO_HOSTS, FIRESTREAM_HOSTS, DOOD_HOSTS, MEDIAFIRE_HOSTS,
+    HLS_MEDIA_SUFFIXES, is_anime4up_host)
 from app.services.anime3rb import resolve_sources as resolve_anime3rb
 from app.services.anime4up import resolve_sources as resolve_anime4up
 from app.services.anime4up_live import resolve_sources as resolve_anime4up_live
@@ -41,15 +43,30 @@ class AnimeStreamResolver:
 
     @staticmethod
     def _build_search_queries(english: Optional[str], romaji: Optional[str]) -> List[str]:
+        raw_titles = [t for t in (english, romaji) if t]
         queries: List[str] = []
-        if english:
-            queries.append(english)
-        if romaji and romaji.lower() != (english or "").lower():
-            queries.append(romaji)
 
+        for title in raw_titles:
+            queries.append(title)
+            norm = re.sub(r"[・:–—\-\|\/]", " ", title)
+            norm = re.sub(r"\s+", " ", norm).strip()
+            if norm and norm.lower() != title.lower():
+                queries.append(norm)
+            base = re.split(r"[:–—\-\|\/]", title)[0].strip()
+            if base and len(base) >= 3 and base.lower() != title.lower():
+                queries.append(base)
+            clean = re.sub(r"\s*[\(\[\{].*?[\)\]\}]", "", title)
+            clean = re.sub(r"\b(pilot\s*film|movie|special|ova|ona)\b", "", clean, flags=re.I).strip()
+            clean = re.sub(r"\s+", " ", clean).strip()
+            if clean and len(clean) >= 3 and clean.lower() not in (title.lower(), base.lower()):
+                queries.append(clean)
+
+        seen = set()
         deduped: List[str] = []
         for q in queries:
-            if q and q.lower() not in [x.lower() for x in deduped]:
+            key = q.lower().strip()
+            if key and key not in seen:
+                seen.add(key)
                 deduped.append(q)
         return deduped
 
@@ -147,11 +164,50 @@ class AnimeStreamResolver:
                 continue
             parsed = urllib.parse.urlsplit(raw)
             host = parsed.hostname or ""
-            if parsed.scheme == "https" and (host in DIRECT_PLAYER_HOSTS | SHARE4MAX_HOSTS | VIDARA_HOSTS | UQLOAD_HOSTS | VOE_HOSTS | MIXDROP_HOSTS or is_anime4up_host(host)):
+
+            if parsed.scheme != "https":
+                continue
+
+            if host in MEDIAFIRE_HOSTS:
+                servers.append({"name": "Mediafire FHD", "type": "embed", "url": raw})
+                seen_urls.add(raw)
+                continue
+
+            if host in STREAMTAPE_HOSTS:
+                embed_url = raw.replace("/v/", "/e/")
+                servers.append({"name": "Streamtape", "type": "embed", "url": embed_url})
+                seen_urls.add(raw)
+                continue
+
+            if host in VINOVO_HOSTS:
+                embed_url = raw.replace("/v/", "/e/")
+                servers.append({"name": "Vinovo", "type": "embed", "url": embed_url})
+                seen_urls.add(raw)
+                continue
+
+            if host in FIRESTREAM_HOSTS:
+                embed_url = raw.replace("/v/", "/e/")
+                servers.append({"name": "Firestream", "type": "embed", "url": embed_url})
+                seen_urls.add(raw)
+                continue
+
+            if host in DOOD_HOSTS:
+                embed_url = raw.replace("/v/", "/e/")
+                servers.append({"name": "Doodstream", "type": "embed", "url": embed_url})
+                seen_urls.add(raw)
+                continue
+
+            if "mega.nz" in host:
+                embed_url = raw.replace("/file/", "/embed/")
+                servers.append({"name": "Mega", "type": "embed", "url": embed_url})
+                seen_urls.add(raw)
+                continue
+
+            if host in DIRECT_PLAYER_HOSTS | SHARE4MAX_HOSTS | VIDARA_HOSTS | UQLOAD_HOSTS | VOE_HOSTS | MIXDROP_HOSTS or is_anime4up_host(host):
                 servers.append({"name": host.removeprefix("www."), "type": "embed", "url": raw})
                 seen_urls.add(raw)
                 continue
-            if parsed.scheme == "https" and host.endswith(HLS_MEDIA_SUFFIXES):
+            if host.endswith(HLS_MEDIA_SUFFIXES):
                 servers.append({"name": "بث مباشر", "type": "hls", "url": raw})
                 seen_urls.add(raw)
                 continue
@@ -256,7 +312,7 @@ class AnimeStreamResolver:
             provider_checks.append(check)
             try:
                 result = await provider(client, id_mal, title_english, title_romaji, episode)
-                playable = [server for server in result if server.get("type") in ("direct", "hls")]
+                playable = [server for server in result if server.get("type") in ("direct", "hls", "embed")]
                 check.update(status="available" if playable else "no_playable_source", servers=len(playable), rejected=len(result) - len(playable))
                 return playable
             except asyncio.CancelledError:
@@ -280,7 +336,7 @@ class AnimeStreamResolver:
                         for task in done:
                             if not task.cancelled() and task.exception() is None:
                                 servers.extend(server for server in task.result()
-                                               if server.get("type") in ("direct", "hls"))
+                                               if server.get("type") in ("direct", "hls", "embed"))
                         if servers:
                             deadline = min(deadline, time.monotonic() + 2.2)
                 finally:
@@ -294,18 +350,25 @@ class AnimeStreamResolver:
             async with asyncio.timeout(15):
                 client = get_source_client()
                 queries = [] if servers else self._build_search_queries(title_english, title_romaji)
-                expected_names = {
-                    re.sub(r"\W+", "", title.casefold())
-                    for title in (title_english, title_romaji) if title
-                }
+                raw_titles = [t for t in (title_english, title_romaji) if t]
+                expected_names = set()
+                for title in raw_titles:
+                    expected_names.add(re.sub(r"\W+", "", title.casefold()))
+                    norm = re.sub(r"[・:–—\-\|\/]", " ", title)
+                    expected_names.add(re.sub(r"\W+", "", norm.casefold()))
+                    base = re.split(r"[:–—\-\|\/]", title)[0].strip()
+                    if base and len(base) >= 3:
+                        expected_names.add(re.sub(r"\W+", "", base.casefold()))
+
                 for q in queries:
                     candidates = await self._search_slayer(client, q)
                     if not candidates:
                         continue
 
                     ranked = self._rank_candidates(candidates, q, title_english, title_romaji)
-                    for match in ranked[:2]:
-                        if re.sub(r"\W+", "", match.get("anime_name", "").casefold()) not in expected_names:
+                    for match in ranked[:3]:
+                        match_clean = re.sub(r"\W+", "", match.get("anime_name", "").casefold())
+                        if match_clean not in expected_names:
                             continue
                         slayer_id = match.get("anime_id")
                         if not slayer_id:
@@ -316,7 +379,7 @@ class AnimeStreamResolver:
                         formatted = self._format_stream_servers(raw_links)
                         checked = await asyncio.gather(*(resolve_player(client, server, id_mal, episode) for server in formatted), return_exceptions=True)
                         available = [server for group in checked if isinstance(group, list)
-                                     for server in group if server.get("type") in ("direct", "hls")]
+                                     for server in group if server.get("type") in ("direct", "hls", "embed")]
                         if available:
                             servers.extend(available)
                             break
@@ -332,7 +395,7 @@ class AnimeStreamResolver:
                 client = get_source_client()
                 tasks = [asyncio.create_task(revalidate_server(client, server))
                          for server in cached[1].get("servers", [])
-                         if server.get("type") in ("direct", "hls")]
+                         if server.get("type") in ("direct", "hls", "embed")]
                 if tasks:
                     done, pending = await asyncio.wait(tasks, timeout=10)
                     for task in pending:
@@ -355,7 +418,8 @@ class AnimeStreamResolver:
                 return 1
             return 2
 
-        for s in sorted(servers, key=lambda source: (source["type"] != "hls", quality_rank(source), cdn_startup_rank(source))):
+        type_priority = {"hls": 0, "direct": 1, "embed": 2}
+        for s in sorted(servers, key=lambda source: (type_priority.get(source.get("type", "embed"), 3), quality_rank(source), cdn_startup_rank(source))):
             parsed = urllib.parse.urlsplit(s["url"])
             # Two catalogs may list the same Mixdrop file with different signatures.
             identity = (parsed.hostname, parsed.path) if (parsed.hostname or "").endswith(".mxcontent.net") else s["url"]
