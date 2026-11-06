@@ -8,8 +8,8 @@ def get_video_client():
     global _client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(12, connect=7, pool=5),
-            limits=httpx.Limits(max_connections=40, max_keepalive_connections=20, keepalive_expiry=60),
+            timeout=httpx.Timeout(20.0, connect=10.0, pool=15.0),
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50, keepalive_expiry=120),
             follow_redirects=True,
         )
     return _client

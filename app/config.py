@@ -58,7 +58,12 @@ class Settings(BaseSettings):
     SQLITE_URL: str = f"sqlite+aiosqlite:///{str(BACKEND_DIR / 'data' / 'masry_stream.db').replace(os.sep, '/')}"
 
     ADMIN_PASSWORD: Optional[str] = None
-    ADMIN_ORIGINS: List[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    ADMIN_ORIGINS: List[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://animeclover.click",
+        "http://animeclover.click",
+    ]
     ADMIN_SECURE_COOKIE: bool = False
 
     CACHE_DIR: str = str(BACKEND_DIR / "cache")
