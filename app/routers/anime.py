@@ -191,7 +191,11 @@ async def get_anime_stream(request: Request, anime_id: int, episode: int = 1, re
             source = {**source, "playback_url": f"/api/anime/{anime_id}/video/{episode}?source={token}&st={st_token}"}
         elif source.get("type") == "hls" and (urlsplit(source["url"]).hostname or "").endswith(HLS_MEDIA_SUFFIXES) and not source.get("is_custom"):
             token = await playback_sources.register(anime_id, episode, source)
-            st_token = security_shield.generate_token(f"{anime_id}:{episode}:{token}", client_ip, user_agent)
+            # A stream token must remain valid while HLS.js requests later playlist
+            # segments. The default five minute API token expires mid-episode.
+            st_token = security_shield.generate_token(
+                f"{anime_id}:{episode}:{token}", client_ip, user_agent, ttl_seconds=14400
+            )
             source = {**source, "playback_url": f"/api/anime/{anime_id}/hls/{episode}?source={token}&st={st_token}"}
         servers.append(source)
     return {**sources, "servers": servers}
