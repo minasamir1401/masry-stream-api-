@@ -10,6 +10,7 @@ from app.database import get_db
 from app.models import Genre, Media, MediaType, media_genres
 from app.schemas import EpisodeRead, MediaListResponse, MediaRead
 from app.services.anime_service import anime_service
+from app.services.title_localization import names_for, provider_search, public_titles
 
 router = APIRouter(prefix="/api", tags=["Media"])
 logger = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ def build_media_urls(media: Media, request: Request) -> dict:
 
 def to_media_read(media: Media, request: Request, episodes: Optional[List[Media]] = None) -> MediaRead:
     urls = build_media_urls(media, request)
+    title_en, title_ar, title_aliases, title_source = names_for({"id": media.id, "title": media.title, "original_title": media.original_title, "title_namespace": "local"})
     episodes_read = []
     related_episodes = media.episodes if episodes is None else episodes
     if related_episodes:
@@ -52,11 +54,17 @@ def to_media_read(media: Media, request: Request, episodes: Optional[List[Media]
 
     return MediaRead(
         id=media.id,
+        title_namespace="local",
         telegram_channel=media.telegram_channel,
         telegram_message_id=media.telegram_message_id,
         telegram_watch_url=media.telegram_watch_url,
-        title=media.title,
-        original_title=media.original_title,
+        title=title_en,
+        canonical_path=f"/{'movie' if media.media_type == 'MOVIE' else 'series'}/{media.id}",
+        title_english=title_en,
+        title_ar=title_ar,
+        title_aliases=title_aliases,
+        title_ar_source=title_source,
+        original_title=title_ar,
         description=media.description,
         release_year=media.release_year,
         duration=media.duration,
@@ -82,6 +90,7 @@ def to_media_read(media: Media, request: Request, episodes: Optional[List[Media]
 
 
 @router.get("/movies", response_model=MediaListResponse)
+@public_titles
 async def list_movies(
     request: Request,
     page: int = Query(1, ge=1),
@@ -157,6 +166,7 @@ async def list_movies(
 
 
 @router.get("/movies/{media_id}", response_model=MediaRead)
+@public_titles
 async def get_movie(
     media_id: int,
     request: Request,
@@ -217,6 +227,7 @@ async def list_series(
 
 
 @router.get("/search", response_model=MediaListResponse)
+@public_titles
 async def search_media(
     request: Request,
     q: str = Query(..., min_length=1),
@@ -224,12 +235,9 @@ async def search_media(
     page_size: int = Query(24, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
-    search_term = f"%{q.strip()}%"
-    filter_condition = or_(
-        Media.title.ilike(search_term),
-        Media.original_title.ilike(search_term),
-        Media.description.ilike(search_term),
-    )
+    terms = {q.strip(), provider_search(q.strip())}
+    filter_condition = or_(*(column.ilike(f"%{term}%") for term in terms
+                             for column in (Media.title, Media.original_title, Media.description)))
 
     count_query = (
         select(func.count(Media.id))

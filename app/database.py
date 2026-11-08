@@ -79,6 +79,9 @@ def _initialize_schema(conn):
         ("visitor_sessions", "ban_reason", "VARCHAR(255)"),
         ("visitor_sessions", "requires_challenge", "BOOLEAN DEFAULT FALSE"),
         ("visitor_sessions", "challenge_solved_at", tz_type),
+        ("analytics_events", "event_id", "VARCHAR(64)"),
+        ("analytics_events", "schema_version", "INTEGER NOT NULL DEFAULT 1"),
+        ("catalog_entries", "canonical_path", "VARCHAR(64)"),
     )
     for table, column, definition in columns_to_ensure:
         try:
@@ -88,6 +91,7 @@ def _initialize_schema(conn):
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}"))
         except Exception as e:
             logger.debug(f"Schema column check ignored for {table}.{column}: {e}")
+    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_analytics_event_id ON analytics_events (event_id)"))
 
 
 async def init_db():

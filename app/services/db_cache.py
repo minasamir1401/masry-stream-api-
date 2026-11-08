@@ -148,6 +148,8 @@ class DBCache:
     async def _db_set(
         session: AsyncSession, key: str, value: Any, expires_at: int
     ) -> None:
+        from app.services.seo_catalog import remember_catalog
+        await remember_catalog(session, {key: value})
         payload = json.dumps(value, default=str)
 
         # Try a dialect-agnostic upsert via raw SQL so it works for both
@@ -178,6 +180,8 @@ class DBCache:
     async def _db_set_many(
         session: AsyncSession, values: Dict[str, Any], expires_at: int
     ) -> None:
+        from app.services.seo_catalog import remember_catalog
+        await remember_catalog(session, values)
         rows = [
             {"key": key, "value": json.dumps(value, default=str), "expires_at": expires_at}
             for key, value in values.items()

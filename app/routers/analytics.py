@@ -1,5 +1,5 @@
 import hashlib
-from typing import Optional
+from typing import Literal, Optional
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,7 +12,10 @@ router = APIRouter(prefix="/api/analytics", tags=["Analytics"])
 
 class TrackEventRequest(BaseModel):
     visitor_id: str = Field(..., min_length=4, max_length=64)
-    event_type: str = Field(..., max_length=32)
+    event_type: Literal["heartbeat", "page_view", "browse_anime", "play_anime", "watch_progress", "search"]
+    event_id: Optional[str] = Field(default=None, min_length=8, max_length=64)
+    schema_version: int = Field(default=1, ge=1, le=2)
+    referrer: Optional[str] = Field(default=None, max_length=255)
     path: str = Field(default="/", max_length=255)
     anime_id: Optional[int] = None
     anime_title: Optional[str] = Field(default=None, max_length=255)
@@ -30,12 +33,12 @@ async def track_event(
         return {"status": "ignored", "reason": "admin_path"}
 
     admin_token = request.cookies.get(admin_auth.COOKIE_NAME)
-    if admin_token and admin_auth.is_valid_admin_token(admin_token):
+    if admin_token and await admin_auth.is_valid_admin_token(admin_token, db):
         return {"status": "ignored", "reason": "admin_session"}
     ip = request.client.host if request.client else ""
     ip_hash = hashlib.sha256(ip.encode("utf-8")).hexdigest()[:16] if ip else None
     user_agent = request.headers.get("user-agent", "")
-    referrer = request.headers.get("referer", "")
+    referrer = body.referrer or request.headers.get("referer", "")
 
     return await analytics_service.record_tracking_event(
         visitor_id=body.visitor_id,
@@ -49,5 +52,7 @@ async def track_event(
         user_agent=user_agent,
         referrer=referrer,
         db=db,
+        event_id=body.event_id,
+        schema_version=body.schema_version,
     )
 

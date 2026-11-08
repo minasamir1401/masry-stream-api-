@@ -4,6 +4,7 @@ from datetime import date, datetime, time as day_time, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
+from app.services.title_localization import public_titles
 
 CAIRO = ZoneInfo("Africa/Cairo")
 DAY_NAMES = ("الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد")
@@ -32,6 +33,7 @@ class AiringScheduleService:
     def week_start(selected: date):
         return selected - timedelta(days=(selected.weekday() - 5) % 7)
 
+    @public_titles
     async def get_week(self, selected: date | None = None):
         today = datetime.now(CAIRO).date()
         start = self.week_start(selected or today)

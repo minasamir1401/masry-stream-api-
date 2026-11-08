@@ -6,6 +6,9 @@ import asyncio
 import time
 from typing import Any, Dict, List, Optional
 import httpx
+from fastapi import HTTPException
+from app.services.seo_catalog import released_count
+from app.services.title_localization import localize_payload, provider_filters, public_titles
 
 from app.services.anime_resolver import anime_stream_resolver
 from app.services.animetna import latest_catalog, resolve_episode_page, get_episode_index
@@ -35,7 +38,7 @@ async def _get_client() -> httpx.AsyncClient:
 ANILIST_API_URL = "https://graphql.anilist.co"
 
 ANIME_LIST_QUERY = """
-query ($page: Int, $perPage: Int, $search: String, $sort: [MediaSort], $format: MediaFormat, $genre: String, $season: MediaSeason, $seasonYear: Int, $status: MediaStatus) {
+query ($page: Int, $perPage: Int, $search: String, $ids: [Int], $sort: [MediaSort], $format: MediaFormat, $genre: String, $season: MediaSeason, $seasonYear: Int, $status: MediaStatus) {
   Page(page: $page, perPage: $perPage) {
     pageInfo {
       total
@@ -44,7 +47,7 @@ query ($page: Int, $perPage: Int, $search: String, $sort: [MediaSort], $format: 
       hasNextPage
       perPage
     }
-    media(type: ANIME, search: $search, sort: $sort, format: $format, genre: $genre, season: $season, seasonYear: $seasonYear, status: $status, isAdult: false) {
+    media(type: ANIME, search: $search, id_in: $ids, sort: $sort, format: $format, genre: $genre, season: $season, seasonYear: $seasonYear, status: $status, isAdult: false) {
       id
       idMal
       title {
@@ -52,6 +55,7 @@ query ($page: Int, $perPage: Int, $search: String, $sort: [MediaSort], $format: 
         english
         native
       }
+      synonyms
       description(asHtml: false)
       startDate {
         year
@@ -88,6 +92,7 @@ query ($id: Int) {
       english
       native
     }
+    synonyms
     description(asHtml: false)
     startDate {
       year
@@ -120,6 +125,7 @@ class AnimeService:
 
     def __init__(self) -> None:
         self._anime_cache: Dict[int, Dict[str, Any]] = {}
+        self._anime_cache_expires = {}
         self._home_cache = None
         self._home_lock = asyncio.Lock()
         self._list_cache = {}
@@ -159,12 +165,14 @@ class AnimeService:
                 "stream_url": f"/api/anime/{item['id']}/stream/{ep_num}",
             })
 
-        return {
+        result = {
             "id": item["id"],
             "id_mal": item.get("idMal"),
             "telegram_channel": "AnimeClover",
             "telegram_message_id": item["id"],
             "title": display_title,
+            "title_namespace": "anilist",
+            "synonyms": item.get("synonyms") or [],
             "title_english": titles.get("english"),
             "title_romaji": titles.get("romaji"),
             "original_title": titles.get("native") or titles.get("romaji"),
@@ -190,7 +198,9 @@ class AnimeService:
             "episodes": episodes_data,
             "stream_url": f"/api/anime/{item['id']}/stream/1",
         }
+        return localize_payload(result)
 
+    @public_titles
     async def _query_list(self, variables: Dict[str, Any], allow_hidden: bool = False) -> Dict[str, Any]:
         import json
         from app.services.anime_override_service import anime_override_service
@@ -256,11 +266,14 @@ class AnimeService:
 
     async def browse(self, page=1, per_page=24, search=None, genre=None, year=None, season=None, status=None, format=None, sort="POPULARITY_DESC", allow_hidden=False):
         variables = {"page": page, "perPage": per_page, "sort": [sort]}
-        for key, value in {"search": search, "genre": genre, "seasonYear": year, "season": season, "status": status, "format": format}.items():
+        if search:
+            variables.update(provider_filters(search))
+        for key, value in {"genre": genre, "seasonYear": year, "season": season, "status": status, "format": format}.items():
             if value:
                 variables[key] = value
         return await self._query_list(variables, allow_hidden=allow_hidden)
 
+    @public_titles
     async def get_homepage(self):
         from app.services.anime_override_service import anime_override_service
         hidden_ids = anime_override_service.get_hidden_anime_ids_sync()
@@ -303,7 +316,7 @@ class AnimeService:
                 return db_hit
 
             query = """query ($ids: [Int]) { Page(perPage: 50) { media(idMal_in: $ids, type: ANIME, isAdult: false) {
-                id idMal title { english romaji native } description(asHtml: false)
+                id idMal title { english romaji native } synonyms description(asHtml: false)
                 startDate { year month day } episodes duration status format genres averageScore popularity
                 nextAiringEpisode { episode airingAt }
                 bannerImage coverImage { extraLarge large medium }
@@ -394,14 +407,17 @@ class AnimeService:
         }, allow_hidden=allow_hidden)
 
     async def search(self, query: str, page: int = 1, per_page: int = 24, allow_hidden: bool = False) -> Dict[str, Any]:
+        filters = provider_filters(query)
         return await self._query_list({
             "page": page,
             "perPage": per_page,
-            "search": query,
-            "sort": ["SEARCH_MATCH", "POPULARITY_DESC"],
+            **filters,
+            "sort": ["SEARCH_MATCH", "POPULARITY_DESC"] if "search" in filters else ["POPULARITY_DESC"],
         }, allow_hidden=allow_hidden)
 
+    @public_titles
     async def get_by_id(self, anime_id: int, allow_hidden: bool = False) -> Optional[Dict[str, Any]]:
+        from app.services.seo_catalog import saved_media
         from app.services.anime_override_service import anime_override_service
         hidden_ids = anime_override_service.get_hidden_anime_ids_sync()
         if not allow_hidden and anime_id in hidden_ids:
@@ -409,7 +425,11 @@ class AnimeService:
 
         # L1 memory cache
         if anime_id in self._anime_cache:
-            return self._anime_cache[anime_id]
+            expiry = self._anime_cache_expires.setdefault(anime_id, time.monotonic() + TTL_ANIME_DETAIL)
+            if expiry > time.monotonic():
+                return self._anime_cache[anime_id]
+            self._anime_cache.pop(anime_id, None)
+            self._anime_cache_expires.pop(anime_id, None)
 
         # L2 DB cache
         db_key = f"anime:{anime_id}"
@@ -429,23 +449,34 @@ class AnimeService:
                 headers={"Content-Type": "application/json"},
             )
             if resp.status_code == 404:
-                return None
+                return await saved_media(anime_id)
             if resp.status_code == 429:
                 logger.warning("AniList rate limited (429), skipping fresh fetch for id %s", anime_id)
-                return None
+                raise HTTPException(503, "مصدر البيانات غير متاح مؤقتًا", headers={"Retry-After": "30"})
             resp.raise_for_status()
-            media = resp.json().get("data", {}).get("Media")
+            response_data = resp.json()
+            if response_data.get("errors"):
+                raise HTTPException(503, "تعذّر تحميل بيانات العمل مؤقتًا", headers={"Retry-After": "30"})
+            media = response_data.get("data", {}).get("Media")
             if not media:
-                return None
+                return await saved_media(anime_id)
             formatted = self._format_media(media)
             if len(self._anime_cache) >= self._MAX_CACHE_SIZE:
                 del self._anime_cache[next(iter(self._anime_cache))]
             self._anime_cache[anime_id] = formatted
             await db_cache.set(db_key, formatted, TTL_ANIME_DETAIL)
             return formatted
+        except HTTPException:
+            saved = await saved_media(anime_id)
+            if saved:
+                return saved
+            raise
         except Exception as e:
-            logger.error("Failed fetching anime details for id %s: %s", anime_id, e)
-            return None
+            saved = await saved_media(anime_id)
+            if saved:
+                return saved
+            logger.warning("Metadata unavailable for id %s: %s", anime_id, type(e).__name__)
+            raise HTTPException(503, "تعذّر الاتصال بمصدر البيانات مؤقتًا", headers={"Retry-After": "30"}) from e
 
     async def get_stream_sources(self, anime_id: int, episode: int = 1, refresh: bool = False, allow_hidden: bool = False) -> Dict[str, Any]:
         item = await self.get_by_id(anime_id, allow_hidden=allow_hidden)
@@ -540,7 +571,7 @@ class AnimeService:
 
         return result
 
-    async def episodes_for_anime(self, anime_id: int, allow_hidden: bool = False):
+    async def episodes_for_anime(self, anime_id: int, allow_hidden: bool = False, verify_sources: bool = True):
         item = await self.get_by_id(anime_id, allow_hidden=allow_hidden)
         if not item:
             return None
@@ -552,20 +583,33 @@ class AnimeService:
                 custom_eps = await anime_override_service.get_custom_episodes(anime_id, session)
         except Exception:
             custom_eps = []
-        custom_map = {e["episode_number"]: e for e in custom_eps}
-
-        try:
-            async with asyncio.timeout(15), httpx.AsyncClient(timeout=5) as client:
-                args = (client, item.get("id_mal"), item.get("title_english") or item["title"], item.get("title_romaji"))
-                sources = await asyncio.gather(get_episode_index(*args), anime3rb_episode_index(*args), get_anime4up_episodes(*args), live_episode_index(*args), return_exceptions=True)
-                source = {number: url for group in sources if isinstance(group, dict) for number, url in group.items()}
-        except (httpx.HTTPError, TimeoutError, ValueError):
-            source = {}
+        custom_map = {e["episode_number"]: e for e in custom_eps if not e.get("is_hidden")}
+        cache_key = f"episode-index:v2:{anime_id}"
+        source = await db_cache.get(cache_key)
+        if source is not None:
+            source = {int(number): url for number, url in source.items()}
+        elif verify_sources or (item.get("status") == "RELEASING" and not released_count(item)):
+            try:
+                async with asyncio.timeout(8), httpx.AsyncClient(timeout=4) as client:
+                    args = (client, item.get("id_mal"), item.get("title_english") or item["title"], item.get("title_romaji"))
+                    tasks = [asyncio.create_task(provider(*args)) for provider in (get_episode_index, anime3rb_episode_index, get_anime4up_episodes, live_episode_index)]
+                    done, pending = await asyncio.wait(tasks, timeout=6)
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    source = {number: url for task in done if not task.cancelled() and task.exception() is None and isinstance(task.result(), dict) for number, url in task.result().items()}
+                    if source:
+                        await db_cache.set(cache_key, source, 300)
+            except (httpx.HTTPError, TimeoutError, ValueError):
+                source = {}
+        source = source or {}
+        if item.get("status") == "RELEASING" and not released_count(item) and not source and not custom_map:
+            raise HTTPException(503, "تعذّر التحقق من الحلقات المعروضة مؤقتًا", headers={"Retry-After": "30"})
 
         total = item.get("total_episodes") or 0
         next_episode = item.get("next_airing_episode")
         max_custom = max(custom_map.keys(), default=0)
-        released = next_episode - 1 if next_episode else (total if item.get("status") == "FINISHED" else max(source, default=0))
+        released = max(released_count(item), max(source, default=0), max_custom)
         if total > 0:
             count = max(total, max_custom)
         else:
@@ -575,7 +619,7 @@ class AnimeService:
         episodes = []
         for number in range(1, count + 1):
             state = "listed" if (number in source or number in custom_map) else "unverified"
-            if item.get("status") == "NOT_YET_RELEASED" or (next_episode and number >= next_episode and number not in source and number not in custom_map):
+            if (item.get("status") == "NOT_YET_RELEASED" or number > released) and number not in custom_map:
                 state = "upcoming"
             episodes.append({"number": number, "state": state})
         return {"anime_id": anime_id, "total": count, "reported_total": total or None,

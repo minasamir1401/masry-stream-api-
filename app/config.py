@@ -1,4 +1,6 @@
 import os
+import secrets
+import time
 from pathlib import Path
 from typing import Any, List, Optional
 from pydantic import field_validator
@@ -71,9 +73,11 @@ class Settings(BaseSettings):
     DATA_DIR: str = str(BACKEND_DIR / "data")
     STREAM_CHUNK_SIZE: int = 1024 * 1024
     STREAM_PREBUFFER_BYTES: int = 2 * 1024 * 1024
+    ARABIC_TRANSLATION_ENABLED: bool = True
+    ARABIC_TRANSLATION_MODEL_DIR: str = str(BACKEND_DIR / "data" / "translation" / "en_ar")
 
     # Anti-Scraping & Streaming Security
-    SECURITY_SIGNING_KEY: str = "animeclover-secure-streaming-hmac-key-2026-production"
+    SECURITY_SIGNING_KEY: str = ""
     SECURITY_TOKEN_TTL_SECONDS: int = 300
     ENABLE_ANTI_BOT: bool = True
     ENABLE_TARPIT: bool = True
@@ -99,3 +103,23 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# One private key shared by workers and retained across restarts. Never use the
+# old publicly known key, including when it is left in deployment environment.
+if not settings.SECURITY_SIGNING_KEY or settings.SECURITY_SIGNING_KEY == "animeclover-secure-streaming-hmac-key-2026-production":
+    key_path = Path(settings.DATA_DIR) / "security-signing-key.txt"
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with key_path.open("x", encoding="utf-8") as key_file:
+            os.chmod(key_path, 0o600)
+            key_file.write(secrets.token_hex(32))
+    except FileExistsError:
+        pass
+    # Another worker may have created the file just before writing its contents.
+    for attempt in range(20):
+        settings.SECURITY_SIGNING_KEY = key_path.read_text(encoding="utf-8").strip()
+        if settings.SECURITY_SIGNING_KEY:
+            break
+        time.sleep(0.05)
+if len(settings.SECURITY_SIGNING_KEY) < 32:
+    raise ValueError("SECURITY_SIGNING_KEY must contain at least 32 characters")

@@ -7,6 +7,13 @@ from starlette.requests import Request
 
 from app.routers.anime import get_anime_video
 from app.services.playback_sources import PlaybackSources
+from app.services.security_shield import security_shield
+
+def request_for(headers=None):
+    return Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": [(b"user-agent", b"test-browser"), *(headers or [])]})
+
+def signature(anime, episode, source):
+    return security_shield.generate_token(f"{anime}:{episode}:{source}", "127.0.0.1", "test-browser")
 
 
 class PlaybackSourceTests(unittest.IsolatedAsyncioTestCase):
@@ -31,11 +38,11 @@ class PlaybackSourceTests(unittest.IsolatedAsyncioTestCase):
             206, content=b"original-file", headers={"Content-Range": "bytes 100-112/1000"})
             if str(request.url) == original["url"] else self.fail("Playback switched to another file")))
         self.addAsyncCleanup(upstream.aclose)
-        request = Request({"type": "http", "headers": [(b"range", b"bytes=100-112")]})
+        request = request_for([(b"range", b"bytes=100-112")])
         with patch("app.routers.anime.playback_sources", self.store):
             with patch("app.routers.anime.anime_service.get_stream_sources", new_callable=AsyncMock) as catalog:
                 with patch("app.routers.anime.get_video_client", return_value=upstream):
-                    response = await get_anime_video(128893, 2, request, 0, source=token)
+                    response = await get_anime_video(128893, 2, request, 0, source=token, st=signature(128893, 2, token))
                     self.assertEqual(b"".join([part async for part in response.body_iterator]), b"original-file")
                 catalog.assert_not_called()
 
@@ -45,7 +52,7 @@ class PlaybackSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.store.get(166613, 2, token))
         with patch("app.routers.anime.playback_sources", self.store):
             with self.assertRaises(HTTPException) as error:
-                await get_anime_video(128893, 3, Request({"type": "http", "headers": []}), 0, source=token)
+                await get_anime_video(128893, 3, request_for(), 0, source=token, st=signature(128893, 3, token))
         self.assertEqual(error.exception.status_code, 404)
 
     async def test_expired_signed_url_is_renewed_once_without_losing_the_byte_range(self):
@@ -60,11 +67,11 @@ class PlaybackSourceTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(206, content=b"x" * 64, headers={"Content-Range": "bytes 100-163/1000"})
         upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         self.addAsyncCleanup(upstream.aclose)
-        request = Request({"type": "http", "headers": [(b"range", b"bytes=100-163")]})
+        request = request_for([(b"range", b"bytes=100-163")])
         with patch("app.routers.anime.playback_sources.get", new_callable=AsyncMock, return_value=selected):
             with patch("app.routers.anime.playback_sources.renew", new_callable=AsyncMock, return_value=renewed) as renew:
                 with patch("app.routers.anime.get_video_client", return_value=upstream):
-                    response = await get_anime_video(128893, 2, request, 0, source="a" * 24)
+                    response = await get_anime_video(128893, 2, request, 0, source="a" * 24, st=signature(128893, 2, "a" * 24))
                     self.assertEqual(len(b"".join([part async for part in response.body_iterator])), 64)
                 renew.assert_awaited_once()
         self.assertEqual(calls, ["/old.mp4", "/renewed.mp4"])

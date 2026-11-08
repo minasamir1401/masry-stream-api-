@@ -156,6 +156,22 @@ class AdminUser(Base):
     )
 
 
+class AdminSession(Base):
+    __tablename__ = "admin_sessions"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("admin_users.id", ondelete="CASCADE"), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
+class CatalogEntry(Base):
+    __tablename__ = "catalog_entries"
+
+    anime_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_path: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+
 class VisitorSession(Base):
     __tablename__ = "visitor_sessions"
 
@@ -185,6 +201,8 @@ class AnalyticsEvent(Base):
     __tablename__ = "analytics_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     visitor_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     event_type: Mapped[str] = mapped_column(
         String(32), nullable=False, index=True

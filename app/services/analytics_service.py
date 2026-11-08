@@ -1,7 +1,9 @@
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from sqlalchemy import delete, desc, func, select
+from sqlalchemy import case, delete, desc, func, select
+from sqlalchemy.exc import IntegrityError
+from urllib.parse import unquote_plus
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AnalyticsEvent, VisitorSession
@@ -53,7 +55,7 @@ def build_action_description(event_type: str, anime_title: Optional[str], episod
     cleaned = clean_anime_title(anime_title)
     duration_min = round(duration_sec / 60, 1) if duration_sec >= 60 else None
 
-    if event_type == "play_anime":
+    if event_type in ("play_anime", "watch_progress"):
         ep_text = f" الحلقة {episode}" if episode else ""
         dur_text = f" (شاهد {duration_min} دقيقة)" if duration_min else ""
         return f"مشاهدة{ep_text} من {cleaned or 'الأنمي'}{dur_text}"
@@ -64,7 +66,7 @@ def build_action_description(event_type: str, anime_title: Optional[str], episod
 
     if event_type == "search":
         query = path.split("q=")[-1].split("&")[0] if "q=" in path else (cleaned or "")
-        return f"بحث في الموقع عن '{query}'" if query else "استخدام محرك البحث"
+        return f"بحث في الموقع عن '{unquote_plus(query)}'" if query else "استخدام محرك البحث"
 
     if event_type == "page_view":
         if path == "/":
@@ -127,11 +129,17 @@ async def record_tracking_event(
     user_agent: Optional[str],
     referrer: Optional[str],
     db: AsyncSession,
+    event_id: Optional[str] = None,
+    schema_version: int = 1,
 ) -> Dict[str, Any]:
+    if event_id and (await db.execute(select(AnalyticsEvent.id).where(AnalyticsEvent.event_id == event_id))).scalar_one_or_none():
+        return {"status": "duplicate"}
+    if event_type == "play_anime" and duration_seconds > 0:
+        event_type = "watch_progress"
     if not path or path.startswith("/admin"):
         return {"status": "ignored", "reason": "admin_path"}
 
-    safe_duration = max(0, min(duration_seconds or 0, 300))
+    safe_duration = max(0, min(duration_seconds or 0, 60 if event_type == "heartbeat" else 300))
     cleaned_title = clean_anime_title(anime_title)
 
     session_query = await db.execute(
@@ -148,7 +156,7 @@ async def record_tracking_event(
             total_page_views=1 if event_type == "page_view" else 0,
             total_anime_browsed=1 if event_type == "browse_anime" else 0,
             total_anime_played=1 if event_type == "play_anime" else 0,
-            total_watch_seconds=safe_duration if event_type == "play_anime" else 0,
+            total_watch_seconds=safe_duration if event_type == "watch_progress" else 0,
             last_path=path[:250] if path else "/",
         )
         db.add(visitor)
@@ -168,28 +176,36 @@ async def record_tracking_event(
             visitor.total_anime_browsed += 1
         elif event_type == "play_anime":
             visitor.total_anime_played += 1
+        elif event_type == "watch_progress":
             visitor.total_watch_seconds += safe_duration
 
-    # Heartbeats update keepalive only and do not flood the discrete events table
-    if event_type != "heartbeat":
-        event = AnalyticsEvent(
-            visitor_id=visitor_id,
-            event_type=event_type,
-            path=path[:250] if path else "/",
-            anime_id=anime_id,
-            anime_title=cleaned_title[:250] if cleaned_title else None,
-            episode_number=episode_number,
-            duration_seconds=safe_duration,
-            referrer=referrer[:250] if referrer else None,
-        )
-        db.add(event)
+    # Retain duration deltas so date filters can use the same period everywhere.
+    event = AnalyticsEvent(
+        event_id=event_id,
+        schema_version=schema_version,
+        visitor_id=visitor_id,
+        event_type=event_type,
+        path=path[:250] if path else "/",
+        anime_id=anime_id,
+        anime_title=cleaned_title[:250] if cleaned_title else None,
+        episode_number=episode_number,
+        duration_seconds=safe_duration,
+        referrer=referrer[:250] if referrer else None,
+    )
+    db.add(event)
 
     if getattr(visitor, "is_banned", False):
         security_shield.set_visitor_ban(visitor_id, True)
     if getattr(visitor, "requires_challenge", False):
         security_shield.set_visitor_challenge(visitor_id, True)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        if event_id and (await db.execute(select(AnalyticsEvent.id).where(AnalyticsEvent.event_id == event_id))).scalar_one_or_none():
+            return {"status": "duplicate"}
+        raise
     return {
         "status": "ok",
         "is_banned": bool(getattr(visitor, "is_banned", False)),
@@ -199,41 +215,24 @@ async def record_tracking_event(
 
 
 async def get_analytics_summary(days: int, db: AsyncSession) -> Dict[str, Any]:
-    # Purge any residual admin test sessions
-    await cleanup_admin_sessions(db)
-
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days if days > 0 else 3650)
     active_window = now - timedelta(minutes=5)
 
     base_filter = VisitorSession.last_path.not_like("/admin%")
 
-    total_visitors_res = await db.execute(
-        select(func.count(VisitorSession.id)).where(base_filter)
-    )
-    total_visitors = total_visitors_res.scalar() or 0
-
-    active_now_res = await db.execute(
-        select(func.count(VisitorSession.id)).where(
-            base_filter,
-            VisitorSession.last_seen >= active_window,
-        )
-    )
-    active_now = active_now_res.scalar() or 0
-
-    duration_res = await db.execute(
-        select(
-            func.coalesce(func.sum(VisitorSession.duration_seconds), 0),
-            func.coalesce(func.sum(VisitorSession.total_watch_seconds), 0),
-            func.coalesce(func.sum(VisitorSession.total_anime_browsed), 0),
-            func.coalesce(func.sum(VisitorSession.total_anime_played), 0),
-        ).where(base_filter)
-    )
-    duration_row = duration_res.first()
-    total_duration_sec = duration_row[0] if duration_row else 0
-    total_watch_sec = duration_row[1] if duration_row else 0
-    total_browsed = duration_row[2] if duration_row else 0
-    total_played = duration_row[3] if duration_row else 0
+    event_filter = (AnalyticsEvent.created_at >= cutoff, AnalyticsEvent.path.not_like("/admin%"))
+    start = (AnalyticsEvent.event_type == "play_anime") & (AnalyticsEvent.duration_seconds == 0)
+    progress = AnalyticsEvent.event_type.in_(["watch_progress", "play_anime"])
+    totals = (await db.execute(select(
+        func.count(func.distinct(AnalyticsEvent.visitor_id)),
+        func.coalesce(func.sum(case((AnalyticsEvent.event_type == "heartbeat", AnalyticsEvent.duration_seconds), else_=0)), 0),
+        func.coalesce(func.sum(case((progress, AnalyticsEvent.duration_seconds), else_=0)), 0),
+        func.coalesce(func.sum(case((AnalyticsEvent.event_type == "browse_anime", 1), else_=0)), 0),
+        func.coalesce(func.sum(case((start, 1), else_=0)), 0),
+    ).where(*event_filter))).one()
+    total_visitors, total_duration_sec, total_watch_sec, total_browsed, total_played = totals
+    active_now = (await db.execute(select(func.count(VisitorSession.id)).where(base_filter, VisitorSession.last_seen >= active_window))).scalar() or 0
 
     total_duration_minutes = round(total_duration_sec / 60, 1)
     total_watch_minutes = round(total_watch_sec / 60, 1)
@@ -244,18 +243,18 @@ async def get_analytics_summary(days: int, db: AsyncSession) -> Dict[str, Any]:
     watched_query = (
         select(
             AnalyticsEvent.anime_id,
-            AnalyticsEvent.anime_title,
-            func.count(AnalyticsEvent.id).label("plays_count"),
+            func.max(AnalyticsEvent.anime_title).label("anime_title"),
+            func.sum(case((start, 1), else_=0)).label("plays_count"),
             func.coalesce(func.sum(AnalyticsEvent.duration_seconds), 0).label("watch_seconds"),
             func.count(func.distinct(AnalyticsEvent.visitor_id)).label("unique_viewers"),
         )
         .where(
-            AnalyticsEvent.event_type == "play_anime",
+            AnalyticsEvent.event_type.in_(["play_anime", "watch_progress"]),
             AnalyticsEvent.created_at >= cutoff,
             AnalyticsEvent.anime_title.isnot(None),
             AnalyticsEvent.path.not_like("/admin%"),
         )
-        .group_by(AnalyticsEvent.anime_id, AnalyticsEvent.anime_title)
+        .group_by(AnalyticsEvent.anime_id)
         .order_by(desc("plays_count"))
         .limit(15)
     )
@@ -274,7 +273,7 @@ async def get_analytics_summary(days: int, db: AsyncSession) -> Dict[str, Any]:
     browsed_query = (
         select(
             AnalyticsEvent.anime_id,
-            AnalyticsEvent.anime_title,
+            func.max(AnalyticsEvent.anime_title).label("anime_title"),
             func.count(AnalyticsEvent.id).label("browse_count"),
             func.count(func.distinct(AnalyticsEvent.visitor_id)).label("unique_browsers"),
         )
@@ -284,7 +283,7 @@ async def get_analytics_summary(days: int, db: AsyncSession) -> Dict[str, Any]:
             AnalyticsEvent.anime_title.isnot(None),
             AnalyticsEvent.path.not_like("/admin%"),
         )
-        .group_by(AnalyticsEvent.anime_id, AnalyticsEvent.anime_title)
+        .group_by(AnalyticsEvent.anime_id)
         .order_by(desc("browse_count"))
         .limit(15)
     )
@@ -301,7 +300,7 @@ async def get_analytics_summary(days: int, db: AsyncSession) -> Dict[str, Any]:
 
     recent_visitors_query = (
         select(VisitorSession)
-        .where(base_filter)
+        .where(base_filter, VisitorSession.last_seen >= cutoff)
         .order_by(desc(VisitorSession.last_seen))
         .limit(30)
     )
@@ -315,6 +314,7 @@ async def get_analytics_summary(days: int, db: AsyncSession) -> Dict[str, Any]:
             select(AnalyticsEvent)
             .where(
                 AnalyticsEvent.visitor_id.in_(visitor_ids),
+                AnalyticsEvent.created_at >= cutoff,
                 AnalyticsEvent.event_type != "heartbeat",
                 AnalyticsEvent.path.not_like("/admin%"),
             )
@@ -342,8 +342,8 @@ async def get_analytics_summary(days: int, db: AsyncSession) -> Dict[str, Any]:
                     "plays": 0,
                     "browses": 0,
                 }
-            if ev.event_type == "play_anime":
-                animes_dict[title]["plays"] += 1
+            if ev.event_type in ("play_anime", "watch_progress"):
+                animes_dict[title]["plays"] += int(ev.event_type == "play_anime" and ev.duration_seconds == 0)
                 animes_dict[title]["watch_seconds"] += ev.duration_seconds
                 if ev.episode_number:
                     animes_dict[title]["episodes"].add(ev.episode_number)
@@ -420,6 +420,7 @@ async def get_analytics_summary(days: int, db: AsyncSession) -> Dict[str, Any]:
         select(AnalyticsEvent)
         .where(
             AnalyticsEvent.event_type != "heartbeat",
+            AnalyticsEvent.created_at >= cutoff,
             AnalyticsEvent.path.not_like("/admin%"),
         )
         .order_by(desc(AnalyticsEvent.created_at))
@@ -445,6 +446,7 @@ async def get_analytics_summary(days: int, db: AsyncSession) -> Dict[str, Any]:
 
     return {
         "period_days": days,
+        "measurement_note": "بدايات التشغيل منفصلة عن تقدم المشاهدة. مدد التصفح التاريخية قبل التحديث غير متاحة حسب الفترة، والمشاهدة داخل المشغلات الخارجية لا يمكن قياسها بدقة.",
         "overview": {
             "total_visitors": total_visitors,
             "active_now": active_now,
@@ -498,8 +500,8 @@ async def get_visitor_detail(visitor_id: str, db: AsyncSession) -> Optional[Dict
                 "browses": 0,
                 "last_seen": ev.created_at.isoformat() if ev.created_at else "",
             }
-        if ev.event_type == "play_anime":
-            animes_dict[title]["plays"] += 1
+        if ev.event_type in ("play_anime", "watch_progress"):
+            animes_dict[title]["plays"] += int(ev.event_type == "play_anime" and ev.duration_seconds == 0)
             animes_dict[title]["watch_seconds"] += ev.duration_seconds
             if ev.episode_number:
                 animes_dict[title]["episodes"].add(ev.episode_number)

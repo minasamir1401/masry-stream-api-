@@ -38,6 +38,10 @@ async def _cache_purge_loop() -> None:
 async def lifespan(app: FastAPI):
     logger.info("Initializing backend services...")
     await init_db()
+    from app.services.seo_catalog import backfill_catalog
+    await backfill_catalog()
+    from app.services.title_localization import warm_catalog_search
+    await warm_catalog_search()
     async with AsyncSessionLocal() as session:
         try:
             admin_user = await ensure_default_admin(session)

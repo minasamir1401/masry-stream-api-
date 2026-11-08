@@ -5,20 +5,21 @@ import os
 import secrets
 import time
 from collections import deque
+from datetime import datetime, timedelta, timezone
+from time import monotonic
 from pathlib import Path
 from typing import Optional, Tuple
 
-from fastapi import HTTPException, Request, Response
-from sqlalchemy import select
+from fastapi import Depends, HTTPException, Request, Response
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import AdminUser
+from app.models import AdminSession, AdminUser
+from app.database import get_db
 
 COOKIE_NAME = "masry_admin"
 SESSION_SECONDS = 7 * 24 * 60 * 60  # 7 days
-revoked_tokens: set[str] = set()
-legacy_sessions: dict[str, dict] = {}
 login_failures: deque[float] = deque()
 
 
@@ -57,7 +58,7 @@ def save_fallback_password(password: str) -> None:
 
 
 async def ensure_default_admin(db: AsyncSession) -> AdminUser:
-    result = await db.execute(select(AdminUser).where(AdminUser.username == "admin"))
+    result = await db.execute(select(AdminUser).limit(1))
     admin = result.scalar_one_or_none()
     if admin is not None:
         return admin
@@ -91,46 +92,17 @@ def check_admin_origin(request: Request):
         raise HTTPException(403, "افتح لوحة الإدارة من رابط الموقع المسموح")
 
 
-def create_signed_token(username: str, ttl: int = SESSION_SECONDS) -> str:
-    issued_at = int(time.time())
-    expires_at = issued_at + ttl
-    key = settings.SECURITY_SIGNING_KEY.encode("utf-8")
-    payload = f"{username}|{issued_at}|{expires_at}"
-    signature = hmac.new(key, payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
-    return f"{username}.{issued_at}.{expires_at}.{signature}"
-
-
-def verify_signed_token(token: Optional[str]) -> Optional[str]:
-    if not token or token in revoked_tokens:
+async def session_username(token: Optional[str], db: AsyncSession) -> Optional[str]:
+    if not token or len(token) > 256:
         return None
-
-    parts = token.split(".")
-    if len(parts) == 4:
-        username, issued_str, expires_str, signature = parts
-        try:
-            expires_at = int(expires_str)
-            issued_at = int(issued_str)
-        except ValueError:
-            return None
-
-        if time.time() > expires_at:
-            return None
-
-        key = settings.SECURITY_SIGNING_KEY.encode("utf-8")
-        payload = f"{username}|{issued_at}|{expires_at}"
-        expected_sig = hmac.new(key, payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
-
-        if hmac.compare_digest(signature, expected_sig):
-            return username
-
-    # Legacy in-memory session check for backwards compatibility
-    if token in legacy_sessions:
-        data = legacy_sessions[token]
-        if data.get("expiry", 0) > time.time():
-            return data.get("username", "admin")
-        legacy_sessions.pop(token, None)
-
-    return None
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    result = await db.execute(
+        select(AdminUser.username).join(AdminSession, AdminSession.user_id == AdminUser.id).where(
+            AdminSession.token_hash == token_hash,
+            AdminSession.expires_at > datetime.now(timezone.utc),
+        )
+    )
+    return result.scalar_one_or_none()
 
 
 def extract_token_from_request(request: Request) -> Optional[str]:
@@ -149,20 +121,15 @@ def extract_token_from_request(request: Request) -> Optional[str]:
     return None
 
 
-def is_valid_admin_token(token: Optional[str]) -> bool:
-    return verify_signed_token(token) is not None
+async def is_valid_admin_token(token: Optional[str], db: AsyncSession) -> bool:
+    return await session_username(token, db) is not None
 
 
-def require_admin(request: Request) -> str:
+async def require_admin(request: Request, db: AsyncSession = Depends(get_db)) -> str:
     check_admin_origin(request)
-    token = extract_token_from_request(request)
-    if not token:
-        raise HTTPException(401, "سجّل الدخول إلى لوحة الإدارة")
-
-    username = verify_signed_token(token)
+    username = await session_username(extract_token_from_request(request), db)
     if not username:
         raise HTTPException(401, "انتهت الجلسة. يرجى تسجيل الدخول مجددًا")
-
     return username
 
 
@@ -174,7 +141,7 @@ async def login(
     db: AsyncSession,
 ) -> Tuple[str, str]:
     check_admin_origin(request)
-    now = time.time()
+    now = monotonic()
     while login_failures and login_failures[0] <= now - 60:
         login_failures.popleft()
     if len(login_failures) >= 5:
@@ -206,11 +173,14 @@ async def login(
 
     login_failures.clear()
 
-    session_token = create_signed_token(admin_user.username)
-    legacy_sessions[session_token] = {
-        "username": admin_user.username,
-        "expiry": now + SESSION_SECONDS,
-    }
+    session_token = secrets.token_urlsafe(48)
+    await db.execute(delete(AdminSession).where(AdminSession.expires_at <= datetime.now(timezone.utc)))
+    db.add(AdminSession(
+        token_hash=hashlib.sha256(session_token.encode()).hexdigest(),
+        user_id=admin_user.id,
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=SESSION_SECONDS),
+    ))
+    await db.commit()
 
     is_secure = (
         settings.ADMIN_SECURE_COOKIE
@@ -229,11 +199,12 @@ async def login(
     return admin_user.username, session_token
 
 
-def logout(request: Request, response: Response):
+async def logout(request: Request, response: Response, db: AsyncSession):
     token = extract_token_from_request(request)
     if token:
-        revoked_tokens.add(token)
-        legacy_sessions.pop(token, None)
+        await db.execute(delete(AdminSession).where(
+            AdminSession.token_hash == hashlib.sha256(token.encode()).hexdigest()))
+        await db.commit()
     response.delete_cookie(COOKIE_NAME, path="/")
     response.delete_cookie(COOKIE_NAME, path="/api")
 
@@ -275,8 +246,8 @@ async def update_admin_credentials(
         new_salt = secrets.token_hex(16)
         admin_user.salt = new_salt
         admin_user.password_hash = hash_password(new_password, new_salt)
-        save_fallback_password(new_password)
 
+    await db.execute(delete(AdminSession).where(AdminSession.user_id == admin_user.id))
     await db.commit()
     await db.refresh(admin_user)
     return updated_username, "تم تحديث بيانات الحساب بنجاح"

@@ -10,6 +10,14 @@ Asynchronous streaming & metadata engine built with Python 3.11, FastAPI, SQLAlc
 - Automatic database migrations and SQLite fallback for local testing
 - Production-ready Dockerfile optimized for Dokploy and Traefik reverse proxies
 
+## AnimeClover updates
+
+The backend includes persistent public anime URL identities, Arabic/English catalog names and search suggestions, Arabic plot summaries with cached local translation, paginated sitemap inventory, session-based admin authentication, and corrected playback analytics.
+
+The Docker build installs the pinned English-to-Arabic model automatically. For a non-Docker installation, after installing `requirements.txt`, run `python scripts/install_arabic_model.py --destination data/translation/en_ar` from this repository. The model is downloaded once during installation, not during API requests.
+
+See [change and validation notes](docs/AUDIT_FIXES.md), [Arabic synopsis provenance](app/title_data/SYNOPSES.md), and [combined-workspace deployment templates](deployment/README.md). Deploy the matching frontend update from [masry-stream-web](https://github.com/minasamir1401/masry-stream-web) alongside this backend.
+
 ## Getting Started
 
 ### Local Development

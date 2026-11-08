@@ -136,6 +136,25 @@ async def get_top_rated(
         raise HTTPException(status_code=502, detail="تعذر جلب الأنميات الأعلى تقييماً")
 
 
+@router.get("/suggestions")
+async def suggest_anime(response: Response, q: str = Query(..., min_length=1, max_length=200), limit: int = Query(6, ge=1, le=8)):
+    response.headers["Cache-Control"] = "no-store"
+    import asyncio
+    from app.services.title_localization import suggest_local
+    query = q.strip()
+    if not query:
+        return {"items": []}
+    items = suggest_local(query, limit, anime_override_service.get_hidden_anime_ids_sync())
+    if items:
+        return {"items": items}
+    try:
+        result = await asyncio.wait_for(anime_service.search(query, per_page=limit), timeout=4)
+        return {"items": result.get("items", [])[:limit]}
+    except Exception as error:
+        logger.info("Search suggestions unavailable: %s", type(error).__name__)
+        raise HTTPException(503, "تعذّر تحميل الاقتراحات حاليًا") from error
+
+
 @router.get("/search")
 async def search_anime(
     q: str = Query(..., min_length=1),
@@ -147,6 +166,16 @@ async def search_anime(
     except Exception as e:
         logger.error("Failed to search anime: %s", e)
         raise HTTPException(status_code=502, detail="فشل البحث عن الأنمي")
+
+
+@router.get("/seo/sitemap/{kind}")
+async def sitemap_inventory(kind: str, page: int = Query(1, ge=1)):
+    from app.services.seo_catalog import sitemap_paths
+    if kind not in ("series", "movies", "episodes"):
+        raise HTTPException(404, "خريطة الموقع غير موجودة")
+    paths = await sitemap_paths(kind)
+    size = 5000
+    return {"paths": paths[(page - 1) * size:page * size], "pages": max(1, (len(paths) + size - 1) // size)}
 
 
 @router.get("/{anime_id}")
@@ -187,7 +216,7 @@ async def get_anime_stream(request: Request, anime_id: int, episode: int = 1, re
         source = {**source, "name": clean_name}
         if source.get("type") == "direct" and not source.get("is_custom"):
             token = await playback_sources.register(anime_id, episode, source)
-            st_token = security_shield.generate_token(f"{anime_id}:{episode}:{token}", client_ip, user_agent)
+            st_token = security_shield.generate_token(f"{anime_id}:{episode}:{token}", client_ip, user_agent, ttl_seconds=14400)
             source = {**source, "playback_url": f"/api/anime/{anime_id}/video/{episode}?source={token}&st={st_token}"}
         elif source.get("type") == "hls" and (urlsplit(source["url"]).hostname or "").endswith(HLS_MEDIA_SUFFIXES) and not source.get("is_custom"):
             token = await playback_sources.register(anime_id, episode, source)
@@ -244,6 +273,8 @@ async def get_anime_video(
     client_ip = security_shield.get_client_ip(request)
     user_agent = request.headers.get("user-agent", "")
 
+    if not source:
+        raise HTTPException(403, "رابط تشغيل موقّع مطلوب")
     if source:
         if not re.fullmatch(r"[a-f0-9]{24}", source):
             raise HTTPException(422, "رابط التشغيل غير صالح")
@@ -252,10 +283,6 @@ async def get_anime_video(
             await security_shield.apply_tarpit(delay=1.0)
             raise HTTPException(403, f"انتهت صلاحية جلسة المشاهدة أو الرمز غير صالح ({reason})")
         selected = await playback_sources.get(anime_id, episode, source)
-    else:
-        sources = await anime_service.get_stream_sources(anime_id, episode)
-        servers = sources.get("servers", [])
-        selected = servers[server] if server < len(servers) else None
     if not selected or selected.get("type") != "direct":
         raise HTTPException(404, "سيرفر الفيديو غير متاح")
     url = selected["url"]
@@ -311,8 +338,8 @@ async def get_anime_video(
 
 
 @router.get("/{anime_id}/episodes")
-async def get_anime_episodes(anime_id: int):
-    result = await anime_service.episodes_for_anime(anime_id)
+async def get_anime_episodes(anime_id: int, verify_sources: bool = True):
+    result = await anime_service.episodes_for_anime(anime_id, verify_sources=verify_sources)
     if result is None:
         raise HTTPException(404, "تعذّر العثور على بيانات هذا الأنمي")
     return result

@@ -59,10 +59,19 @@ class EpisodeRead(BaseModel):
 
 class MediaRead(BaseModel):
     id: int
+    title_namespace: Optional[str] = None
+    description_ar: Optional[str] = None
+    description_ar_kind: Optional[str] = None
+    description_source_url: Optional[str] = None
+    canonical_path: Optional[str] = None
     telegram_channel: str
     telegram_message_id: int
     telegram_watch_url: Optional[str] = None
     title: str
+    title_english: Optional[str] = None
+    title_ar: Optional[str] = None
+    title_ar_source: Optional[str] = None
+    title_aliases: List[str] = []
     original_title: Optional[str] = None
     description: Optional[str] = None
     release_year: Optional[int] = None

@@ -80,12 +80,12 @@ async def login(
     if body.visitor_id:
         await analytics_service.cleanup_visitor_id(body.visitor_id, db)
         await analytics_service.cleanup_admin_sessions(db, [body.visitor_id])
-    return {"status": "authenticated", "username": username, "token": token}
+    return {"status": "authenticated", "username": username}
 
 
 @router.post("/logout")
-async def logout(request: Request, response: Response):
-    admin_auth.logout(request, response)
+async def logout(request: Request, response: Response, db: AsyncSession = Depends(get_db)):
+    await admin_auth.logout(request, response, db)
     return {"status": "signed_out"}
 
 
@@ -101,6 +101,8 @@ async def admin_status(current_user: str = Depends(admin_auth.require_admin)):
 @router.post("/change-credentials")
 async def change_credentials(
     body: ChangeCredentialsRequest,
+    response: Response,
+    request: Request,
     current_user: str = Depends(admin_auth.require_admin),
     db: AsyncSession = Depends(get_db),
 ):
@@ -114,6 +116,8 @@ async def change_credentials(
         new_password=body.new_password,
         db=db,
     )
+    # Replace this browser's cookie after revoking all older sessions.
+    await admin_auth.login(updated_username, body.new_password or body.current_password, request, response, db)
     return {
         "status": "success",
         "username": updated_username,
