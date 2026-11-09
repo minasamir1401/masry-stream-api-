@@ -43,10 +43,11 @@ Implemented in the local frontend and backend source. Production has not been de
 - Watch, series, and movie story renderers share the Arabic synopsis. Foreign descriptions and the former expandable original-language block are excluded from the UI. The frontend response boundary also excludes the original synopsis from serialized page props.
 - Bilingual headings prioritize the Arabic name visually and retain the English name as secondary text; search and metadata continue to support both.
 - Work and episode meta descriptions, social descriptions, and JSON-LD use the same Arabic summary while keeping both Arabic and English names searchable. The canonical work/episode URLs remain unchanged.
-- Added ten reviewed Arabic plot summaries, including the reported Black Clover Season 2 work `195604`. Each override is keyed by exact AniList identity and a checksum of the source synopsis; an edited source must be translated again instead of reusing a stale review.
+- Added twelve reviewed Arabic plot summaries, including Black Clover Season 2 (`195604`), Naruto (`20`), and Sword Art Online (`11757`). Each override is keyed by exact AniList identity and a checksum of the source synopsis. An edited source must be translated again instead of reusing a stale review.
 - Other English synopses can be translated locally with the pinned Argos EN→AR model using CTranslate2/SentencePiece on CPU. No translation API key or per-request external translation call is required. Model downloads happen once at install/build time, with a pinned SHA-256 check.
 - Translations are cached by work ID, model-cache version, and source-text hash for a year. Duplicate work requests share a generation task; one translation thread and a bounded queue prevent concurrent CPU-heavy jobs. Requests wait at most three seconds; when a model is missing, translation fails, or a job is still running, the UI shows labelled Arabic work facts instead of a foreign or invented plot. A later request uses the finished translation.
 - Machine-generated summaries display an Arabic machine-translation label. Reviewed summaries take precedence for matching sources. Model quality, especially uncommon proper names, can require editorial correction.
+- If the model copies a long English passage, it retries that passage in shorter clauses. A failed translation is cached for 15 minutes per work and source checksum, so requests across workers can use the Arabic fallback without retrying on every visit.
 - The discussion UI separates the rating card and comments, uses labelled multiline inputs, native radio star controls with 44px targets, Arabic status/error messages, and responsive layouts. Failed comments retain their text; failed likes roll back their optimistic count; non-success rating responses are shown as failures.
 - Automatic PWA installation prompts are suppressed on `/watch/` pages. The explicit header installation button remains available.
 
@@ -66,6 +67,8 @@ Validation includes real local-model inference plus persistent-cache reuse, sour
 - Work metadata is retained independently of cache expiry. If a provider fails, known work pages can use the saved metadata and display a stale-information notice. A temporary episode-list failure does not remove the saved work page. Playback availability is still checked when opening a video.
 - Cache deletion and restart do not delete the permanent inventory. Preserve the production database volume and include it in normal backups: recovery of saved identities/paths depends on restoring that database. This persistence applies to public work/episode page URLs; upstream media-file URLs and signed playback tokens retain their normal expiry.
 - Regression coverage: `python -m unittest test_catalog_links_search` covers edits, artwork/category changes, cache deletion, restart, legacy migration, provider outage, sitemap paths, and Arabic/English typeahead behavior.
+
+PostgreSQL schema initialization acquires a transaction-scoped advisory lock before checking or creating tables. This serializes concurrent Uvicorn worker migrations. `test_database_startup` can exercise the upgrade from two connections when `POSTGRES_STARTUP_TEST_URL` points to an isolated PostgreSQL test database.
 
 ## Analytics
 

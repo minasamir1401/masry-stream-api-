@@ -69,8 +69,13 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 def _initialize_schema(conn):
-    Base.metadata.create_all(conn)
     is_pg = conn.dialect.name == "postgresql"
+    if is_pg:
+        # Each Uvicorn worker runs lifespan. Lock before create_all's existence
+        # checks so PostgreSQL catalog/type creation cannot race across workers.
+        # Transaction scope releases the lock on commit or rollback/crash.
+        conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": 0x414E494D45434C56})
+    Base.metadata.create_all(conn)
     tz_type = "TIMESTAMP WITH TIME ZONE" if is_pg else "DATETIME"
     columns_to_ensure = (
         ("media", "telegram_watch_url", "VARCHAR(512)"),
@@ -84,21 +89,20 @@ def _initialize_schema(conn):
         ("catalog_entries", "canonical_path", "VARCHAR(64)"),
     )
     for table, column, definition in columns_to_ensure:
-        try:
-            if is_pg:
-                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}"))
-            elif column not in {field["name"] for field in inspect(conn).get_columns(table)}:
-                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}"))
-        except Exception as e:
-            logger.debug(f"Schema column check ignored for {table}.{column}: {e}")
+        if is_pg:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}"))
+        elif column not in {field["name"] for field in inspect(conn).get_columns(table)}:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}"))
     conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_analytics_event_id ON analytics_events (event_id)"))
 
 
 async def init_db():
     global engine, AsyncSessionLocal
     import app.models
+    connected = False
     try:
         async with engine.begin() as conn:
+            connected = True
             await conn.run_sync(_initialize_schema)
         logger.info("Database schema initialized successfully")
         try:
@@ -108,7 +112,7 @@ async def init_db():
         except Exception as err:
             logger.warning("Could not preload hidden anime ids: %s", err)
     except Exception as e:
-        if settings.SQLITE_FALLBACK and not settings.DATABASE_URL.startswith("sqlite"):
+        if settings.SQLITE_FALLBACK and not connected and not settings.DATABASE_URL.startswith("sqlite"):
             logger.warning(
                 f"Failed to connect to PostgreSQL ({e}). Initializing SQLite fallback engine."
             )
@@ -124,7 +128,6 @@ async def init_db():
             except Exception as err:
                 logger.warning("Could not preload hidden anime ids: %s", err)
         else:
-            logger.error(
-                "Database initialization failed: %s. Continuing startup in degraded mode.", e
-            )
+            logger.exception("Database schema initialization failed; stopping startup")
+            raise
 

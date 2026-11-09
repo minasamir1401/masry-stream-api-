@@ -3,6 +3,7 @@ import copy
 import unittest
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, Mock
 from app.services.arabic_descriptions import ArabicDescriptions, is_arabic, factual_summary, clean_synopsis
 from app.config import settings
@@ -51,13 +52,30 @@ class ArabicDescriptionTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(item['description']==ARABIC for item in items))
 
     async def test_translation_failure_keeps_foreign_text_out_of_public_description(self):
-        with patch.object(self.service,'_translate',Mock(side_effect=RuntimeError('model unavailable'))):
-            item={'id':999995,'title':'Wizard','media_type':'SERIES','description':ENGLISH}
-            await self.service.enrich(item)
+        original={'id':999995,'title':'Wizard','media_type':'SERIES','description':ENGLISH}
+        with patch.object(self.service,'_translate',Mock(side_effect=RuntimeError('model unavailable'))) as translator:
+            item = await self.service.enrich(copy.deepcopy(original))
+            await self.service.enrich(copy.deepcopy(original))
+            translator.assert_called_once()
+            await self.service.enrich({**original, 'description': ENGLISH + ' The story has changed.'})
+            self.assertEqual(translator.call_count, 2)
         self.assertEqual(item['description_ar_kind'],'facts')
         self.assertTrue(is_arabic(item['description']))
         self.assertNotIn(ENGLISH,item['description'])
         self.assertEqual(item['description_original'],ENGLISH)
+
+    def test_copied_english_sentence_retries_shorter_clauses(self):
+        def encode(value, out_type):
+            return [part.split() for part in value] if isinstance(value, list) else value.split()
+        source = "A young wizard travels with friends, and they protect the village together."
+        self.service._tokenizer = SimpleNamespace(encode=encode, decode=lambda tokens: " ".join(tokens))
+        row = lambda value: SimpleNamespace(hypotheses=[value.split()])
+        self.service._translator = SimpleNamespace(translate_batch=Mock(side_effect=[
+            [row(source)], [row("ينطلق ساحر شاب مع أصدقائه،"), row("ويحمون القرية معًا.")],
+        ]))
+        result = self.service._translate(source)
+        self.assertEqual(self.service._translator.translate_batch.call_count, 2)
+        self.assertEqual(result, "ينطلق ساحر شاب مع أصدقائه، ويحمون القرية معًا.")
 
     async def test_local_identifier_and_changed_source_do_not_reuse_reviewed_anime_plot(self):
         with patch.object(settings,'ARABIC_TRANSLATION_ENABLED',False):
