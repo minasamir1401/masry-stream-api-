@@ -10,7 +10,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
-    PROJECT_NAME: str = "Anime Clover - عالم الأنمي المترجم"
+    PROJECT_NAME: str = "cloverfilx - عالم الأنمي المترجم"
     VERSION: str = "1.0.0"
     DEBUG: bool = True
 
