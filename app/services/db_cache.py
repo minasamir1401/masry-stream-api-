@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 TTL_ANIME_DETAIL = 86_400       # 24 h
 TTL_LIST         = 1_800        # 30 min
 TTL_STREAM       = 1_800        # 30 min
-TTL_HOMEPAGE     = 3_600        # 1 h
+TTL_HOMEPAGE     = 1_800        # 30 min
 
 
 class DBCache:
@@ -64,6 +64,21 @@ class DBCache:
         except Exception as exc:
             logger.debug("db_cache.get failed for %s: %s", key, exc)
 
+        return None
+
+    async def get_stale(self, key: str) -> Optional[Any]:
+        """Return cached value even if expired, for upstream outage fallbacks."""
+        entry = self._l1.get(key)
+        if entry:
+            return entry[1]
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(select(CacheEntry).where(CacheEntry.key == key))
+                row: Optional[CacheEntry] = result.scalars().first()
+                if row is not None:
+                    return json.loads(row.value)
+        except Exception as exc:
+            logger.debug("db_cache.get_stale failed for %s: %s", key, exc)
         return None
 
     async def set(self, key: str, value: Any, ttl: int) -> None:
@@ -142,6 +157,21 @@ class DBCache:
         row: Optional[CacheEntry] = result.scalars().first()
         if row is None:
             return None
+
+    async def get_stale(self, key: str) -> Optional[Any]:
+        """Return cached value even if expired, for upstream outage fallbacks."""
+        entry = self._l1.get(key)
+        if entry:
+            return entry[1]
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(select(CacheEntry).where(CacheEntry.key == key))
+                row: Optional[CacheEntry] = result.scalars().first()
+                if row is not None:
+                    return json.loads(row.value)
+        except Exception as exc:
+            logger.debug("db_cache.get_stale failed for %s: %s", key, exc)
+        return None
         return {"value": json.loads(row.value), "expires_at": row.expires_at}
 
     @staticmethod

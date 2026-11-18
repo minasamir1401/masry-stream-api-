@@ -1,8 +1,9 @@
 """Read the current publisher instead of relying only on its archived mirror."""
+import asyncio
 import html
 import re
 import time
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
 
@@ -121,3 +122,104 @@ async def resolve_sources(client, id_mal, english, romaji, episode):
         return [server for group in results if isinstance(group, list) for server in group if server.get("type") in ("direct", "hls", "embed")]
     except (httpx.HTTPError, ValueError, TypeError):
         return []
+
+
+def _anime_slug_from_episode_path(path: str) -> str:
+    decoded = unquote(path).strip("/")
+    segment = decoded.split("/")[-1]
+    segment = re.sub(r"^(?:انمي|فيلم|فلم)-", "", segment)
+    segment = re.sub(r"-(?:الحلقة|حلقة|الأونا|اونا|الأوفا|اوفا|الفلم|فيلم|الخاصة|خاصة)-[0-9]+.*$", "", segment)
+    return re.sub(r"[^a-z0-9-]+", "-", segment.lower()).strip("-")
+
+
+async def latest_episodes(client: httpx.AsyncClient, limit: int = 24) -> list[dict]:
+    """Read recently published episodes from the active anime4up publisher."""
+    try:
+        base = await origin(client)
+        response = await client.get(f"{base}/", timeout=10, follow_redirects=True)
+        response.raise_for_status()
+    except (httpx.HTTPError, ValueError):
+        return []
+
+    discovered = []
+    seen_slugs = set()
+    for raw, label in SourcePage(response.text).links:
+        parsed = urlsplit(urljoin(base, raw))
+        if not publisher_host(parsed.hostname) or not parsed.path.startswith("/episode/"):
+            continue
+        number = re.search(r"(?:الحلقة|حلقة|الأونا|الأوفا|الفلم|فيلم|Episode)\s*([0-9]+)(?![0-9])", label, re.I)
+        if not number:
+            number = re.search(r"-([0-9]+)-(?:مترجمة|مترجم|اون-لاين)/?$", unquote(parsed.path))
+        if not number:
+            continue
+        slug = _anime_slug_from_episode_path(parsed.path)
+        if not slug or slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+        canonical_ep = parsed._replace(query="", fragment="").geturl()
+        discovered.append((slug, int(number[1]), canonical_ep))
+        if len(discovered) >= limit:
+            break
+
+    semaphore = asyncio.Semaphore(8)
+
+    async def resolve_mal(slug: str, ep_url: str) -> int | None:
+        cache_key = f"mal-map:anime4up:{slug}"
+        cached = await db_cache.get(cache_key)
+        if isinstance(cached, int) and cached > 0:
+            return cached
+        async with semaphore:
+            direct_url = f"{base}/anime/{slug}/"
+            try:
+                direct_resp = await client.get(direct_url, timeout=4, follow_redirects=True)
+                if direct_resp.status_code == 200:
+                    mal = re.search(r"myanimelist\.net/anime/(\d+)", direct_resp.text)
+                    if mal:
+                        mal_id = int(mal[1])
+                        await db_cache.set(cache_key, mal_id, 30 * 86400)
+                        return mal_id
+            except httpx.HTTPError:
+                pass
+            candidate_paths = []
+            try:
+                ep_resp = await client.get(ep_url, timeout=4, follow_redirects=True)
+                if ep_resp.status_code == 200:
+                    mal = re.search(r"myanimelist\.net/anime/(\d+)", ep_resp.text)
+                    if mal:
+                        mal_id = int(mal[1])
+                        await db_cache.set(cache_key, mal_id, 30 * 86400)
+                        return mal_id
+                    for raw_link, _ in SourcePage(ep_resp.text).links:
+                        u = urlsplit(urljoin(base, raw_link))
+                        if publisher_host(u.hostname) and u.path.startswith("/anime/"):
+                            url_clean = u._replace(query="", fragment="").geturl()
+                            if url_clean != direct_url:
+                                candidate_paths.append(url_clean)
+                            break
+            except httpx.HTTPError:
+                pass
+            for anime_url in dict.fromkeys(candidate_paths):
+                try:
+                    anime_resp = await client.get(anime_url, timeout=4, follow_redirects=True)
+                    if anime_resp.status_code == 200:
+                        mal = re.search(r"myanimelist\.net/anime/(\d+)", anime_resp.text)
+                        if mal:
+                            mal_id = int(mal[1])
+                            await db_cache.set(cache_key, mal_id, 30 * 86400)
+                            return mal_id
+                except httpx.HTTPError:
+                    continue
+        return None
+
+    mal_ids = await asyncio.gather(*(resolve_mal(slug, ep_url) for slug, _, ep_url in discovered))
+    entries = []
+    for order, ((_, ep_num, ep_url), mal_id) in enumerate(zip(discovered, mal_ids)):
+        if mal_id:
+            entries.append({
+                "mal": mal_id,
+                "episode": ep_num,
+                "source": ep_url,
+                "order": order,
+                "provider": "anime4up_live",
+            })
+    return entries

@@ -625,36 +625,167 @@ async def resolve_episode_page(client, selected, id_mal, episode):
         )
 
 
-async def latest_catalog(client, limit=28):
-    response = await client.get(BASE_URL)
-    response.raise_for_status()
+def _animetna_relevant_markup(markup: str) -> str:
+    """Exclude archive batch sections (e.g. old-year re-uploads) on animetna."""
+    latest_block = markup.find("آخر الحلقات المضافة")
+    seasonal_block = markup.find("أحدث أنميات موسم")
+    if seasonal_block == -1:
+        seasonal_block = markup.find("يعرض الآن")
+    archive_block = markup.find("أحدث الانميات المضافة")
+    top_rated_block = markup.find("الأعلى تقييماً")
+
+    parts = []
+    if latest_block != -1:
+        parts.append(markup[:latest_block])
+    if seasonal_block != -1:
+        end = min(
+            (pos for pos in (archive_block, top_rated_block) if pos > seasonal_block),
+            default=len(markup),
+        )
+        parts.append(markup[seasonal_block:end])
+    return "\n".join(parts) if parts else markup
+
+
+async def _animetna_current_entries(client: httpx.AsyncClient, limit: int = 16) -> list[dict]:
+    try:
+        response = await client.get(BASE_URL, timeout=10)
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return []
+
+    section_html = _animetna_relevant_markup(response.text)
     urls = []
-    for url, label in SourcePage(response.text).links:
+    for url, _ in SourcePage(section_html).links:
         parsed = urlsplit(url)
         if parsed.hostname == "animetna.com" and re.fullmatch(r"/anime/[^/]+/", parsed.path) and url not in urls:
             urls.append(url)
+            if len(urls) >= limit:
+                break
+
     semaphore = asyncio.Semaphore(4)
-    async def read(url, order):
+
+    async def read(url: str, order: int):
         async with semaphore:
             try:
-                response = await client.get(url)
-                response.raise_for_status()
-                mal = re.search(r"myanimelist\.net/anime/([0-9]+)", response.text)
+                resp = await client.get(url, timeout=8)
+                resp.raise_for_status()
+                mal = re.search(r"myanimelist\.net/anime/([0-9]+)", resp.text)
                 if not mal:
                     return None
-                _episode_indexes[int(mal[1])] = (time.monotonic() + 600, page_episode_index(response.text))
+                _episode_indexes[int(mal[1])] = (time.monotonic() + 600, page_episode_index(resp.text))
                 episodes = []
-                for link, label in SourcePage(response.text).links:
+                for link, label in SourcePage(resp.text).links:
                     parsed = urlsplit(link)
                     if parsed.hostname != "animetna.com" or not parsed.path.startswith("/episode/"):
                         continue
-                    match = re.search(r"(?:الحلقة|حلقة|Episode)\s*([0-9]+)", label, re.I) or re.search(r"-episode-([0-9]+)(?:/|$)", parsed.path)
+                    match = re.search(r"(?:الحلقة|حلقة|Episode)\s*([0-9]+)", label, re.I) or re.search(
+                        r"-episode-([0-9]+)(?:/|$)", parsed.path
+                    )
                     episodes.append((int(match[1]) if match else 1, f"{BASE_URL}{parsed.path}"))
                 if not episodes:
                     return None
                 number, source = max(episodes, key=lambda entry: entry[0])
-                return {"mal": int(mal[1]), "episode": number, "source": source, "order": order}
+                return {"mal": int(mal[1]), "episode": number, "source": source, "order": order, "provider": "animetna"}
             except (httpx.HTTPError, ValueError):
                 return None
-    entries = await asyncio.gather(*(read(url, order) for order, url in enumerate(urls[:limit])))
+
+    entries = await asyncio.gather(*(read(url, order) for order, url in enumerate(urls)))
     return [entry for entry in entries if entry]
+
+
+async def _anilist_recent_aired(client: httpx.AsyncClient, limit: int = 28) -> list[dict]:
+    now = int(time.time())
+    query = """
+    query ($from: Int!, $to: Int!) {
+      Page(page: 1, perPage: 40) {
+        airingSchedules(airingAt_greater: $from, airingAt_lesser: $to, sort: TIME_DESC) {
+          episode
+          media { idMal isAdult popularity }
+        }
+      }
+    }
+    """
+    try:
+        resp = await client.post(
+            "https://graphql.anilist.co",
+            json={"query": query, "variables": {"from": now - 14 * 86400, "to": now}},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        schedules = resp.json().get("data", {}).get("Page", {}).get("airingSchedules") or []
+    except (httpx.HTTPError, ValueError, TypeError):
+        return []
+
+    seen = set()
+    entries = []
+    for item in schedules:
+        media = item.get("media") or {}
+        mal = media.get("idMal")
+        if media.get("isAdult") or not mal or mal in seen:
+            continue
+        seen.add(mal)
+        entries.append({
+            "mal": int(mal),
+            "episode": int(item.get("episode") or 1),
+            "source": "",
+            "order": len(entries),
+            "provider": "anilist",
+        })
+        if len(entries) >= limit:
+            break
+    return entries
+
+
+async def latest_catalog(client, limit=28):
+    from app.services.anime3rb import latest_episodes as anime3rb_latest
+    from app.services.anime4up_live import latest_episodes as anime4up_latest
+
+    async def _bounded(coro, timeout: float = 8.0):
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except Exception:
+            return []
+
+    results = await asyncio.gather(
+        _bounded(anime3rb_latest(client, limit=min(limit, 24)), timeout=8.0),
+        _bounded(anime4up_latest(client, limit=min(limit, 18)), timeout=8.0),
+        _bounded(_animetna_current_entries(client, limit=min(limit, 16)), timeout=8.0),
+        return_exceptions=True,
+    )
+
+    merged: dict[int, dict] = {}
+    order_seq: list[int] = []
+    for batch in results:
+        if not isinstance(batch, list):
+            continue
+        for entry in batch:
+            mal = entry.get("mal")
+            if not mal:
+                continue
+            existing = merged.get(mal)
+            if existing is None:
+                merged[mal] = dict(entry)
+                order_seq.append(mal)
+            elif int(entry.get("episode") or 0) > int(existing.get("episode") or 0):
+                # Prefer the provider carrying the newer episode while preserving position.
+                existing["episode"] = entry["episode"]
+                if entry.get("source"):
+                    existing["source"] = entry["source"]
+                if entry.get("provider"):
+                    existing["provider"] = entry["provider"]
+
+    if len(order_seq) < limit:
+        for entry in await _anilist_recent_aired(client, limit=limit):
+            mal = entry["mal"]
+            if mal not in merged:
+                merged[mal] = entry
+                order_seq.append(mal)
+                if len(order_seq) >= limit:
+                    break
+
+    final_entries = []
+    for idx, mal in enumerate(order_seq[:limit]):
+        item = merged[mal]
+        item["order"] = idx
+        final_entries.append(item)
+    return final_entries

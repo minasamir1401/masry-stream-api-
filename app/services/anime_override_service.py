@@ -49,6 +49,7 @@ class AnimeOverrideService:
         # Invalidate related caches
         await db_cache.delete(f"anime:{anime_id}")
         await db_cache.delete("homepage:v2")
+        await db_cache.delete("homepage:v3")
         return {"anime_id": record.anime_id, "is_hidden": record.is_hidden, "title": record.title}
 
     async def unhide_anime(self, anime_id: int, db: AsyncSession) -> Dict[str, Any]:
@@ -66,6 +67,7 @@ class AnimeOverrideService:
 
         await db_cache.delete(f"anime:{anime_id}")
         await db_cache.delete("homepage:v2")
+        await db_cache.delete("homepage:v3")
         return {"anime_id": anime_id, "is_hidden": False}
 
     async def list_hidden_anime(self, db: AsyncSession) -> List[Dict[str, Any]]:

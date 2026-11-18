@@ -135,12 +135,20 @@ async def list_movies(
 
     if total == 0:
         try:
-            if media_type == "SERIES":
-                anime_data = await anime_service.get_popular_series(page=page, per_page=page_size)
-            elif media_type == "MOVIE":
-                anime_data = await anime_service.get_anime_movies(page=page, per_page=page_size)
-            else:
-                anime_data = await anime_service.get_trending(page=page, per_page=page_size)
+            sort_map = {
+                "latest": "START_DATE_DESC",
+                "views": "POPULARITY_DESC",
+                "title": "TITLE_ROMAJI",
+            }
+            anime_format = "MOVIE" if media_type == "MOVIE" else ("TV" if media_type == "SERIES" else None)
+            anime_genre = genre.replace("-", " ").title() if genre else None
+            anime_data = await anime_service.browse(
+                page=page,
+                per_page=page_size,
+                genre=anime_genre,
+                format=anime_format,
+                sort=sort_map.get(sort_by, "POPULARITY_DESC"),
+            )
             if anime_data.get("items"):
                 return MediaListResponse(**anime_data)
         except Exception as e:

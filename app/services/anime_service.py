@@ -1,26 +1,55 @@
 from datetime import datetime
 import html
+import json
 import logging
 import re
 import asyncio
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 import httpx
 from fastapi import HTTPException
 from app.services.seo_catalog import released_count
-from app.services.title_localization import localize_payload, provider_filters, public_titles
+from app.services.title_localization import (
+    compact_search,
+    english_query_for_ids,
+    has_arabic,
+    localize_payload,
+    normalize_search,
+    provider_filters,
+    public_titles,
+)
 
 from app.services.anime_resolver import anime_stream_resolver
 from app.services.animetna import latest_catalog, resolve_episode_page, get_episode_index
-from app.services.anime3rb import episode_index as anime3rb_episode_index
+from app.services.anime3rb import (
+    episode_index as anime3rb_episode_index,
+    resolve_sources as anime3rb_resolve_sources,
+)
 from app.services.anime4up import get_anime4up_episodes
-from app.services.anime4up_live import episode_index as live_episode_index
+from app.services.anime4up_live import (
+    episode_index as live_episode_index,
+    publisher_host as is_live_anime4up_host,
+    resolve_sources as live_resolve_sources,
+)
 from app.services.db_cache import db_cache, TTL_ANIME_DETAIL, TTL_LIST, TTL_HOMEPAGE, TTL_STREAM
 
 logger = logging.getLogger(__name__)
 
 _shared_client: Optional[httpx.AsyncClient] = None
 _client_lock = asyncio.Lock()
+_loop_semaphores: Dict[int, asyncio.Semaphore] = {}
+
+
+def _anilist_semaphore() -> asyncio.Semaphore:
+    loop_id = id(asyncio.get_running_loop())
+    sem = _loop_semaphores.get(loop_id)
+    if sem is None:
+        if len(_loop_semaphores) > 8:
+            _loop_semaphores.clear()
+        sem = asyncio.Semaphore(3)
+        _loop_semaphores[loop_id] = sem
+    return sem
 
 
 async def _get_client() -> httpx.AsyncClient:
@@ -38,7 +67,7 @@ async def _get_client() -> httpx.AsyncClient:
 ANILIST_API_URL = "https://graphql.anilist.co"
 
 ANIME_LIST_QUERY = """
-query ($page: Int, $perPage: Int, $search: String, $ids: [Int], $sort: [MediaSort], $format: MediaFormat, $genre: String, $season: MediaSeason, $seasonYear: Int, $status: MediaStatus) {
+query ($page: Int, $perPage: Int, $search: String, $ids: [Int], $sort: [MediaSort], $format: MediaFormat, $genre: String, $season: MediaSeason, $seasonYear: Int, $status: MediaStatus, $status_in: [MediaStatus], $startDate_greater: FuzzyDateInt, $startDate_lesser: FuzzyDateInt) {
   Page(page: $page, perPage: $perPage) {
     pageInfo {
       total
@@ -47,7 +76,7 @@ query ($page: Int, $perPage: Int, $search: String, $ids: [Int], $sort: [MediaSor
       hasNextPage
       perPage
     }
-    media(type: ANIME, search: $search, id_in: $ids, sort: $sort, format: $format, genre: $genre, season: $season, seasonYear: $seasonYear, status: $status, isAdult: false) {
+    media(type: ANIME, search: $search, id_in: $ids, sort: $sort, format: $format, genre: $genre, season: $season, seasonYear: $seasonYear, status: $status, status_in: $status_in, startDate_greater: $startDate_greater, startDate_lesser: $startDate_lesser, isAdult: false) {
       id
       idMal
       title {
@@ -129,6 +158,7 @@ class AnimeService:
         self._home_cache = None
         self._home_lock = asyncio.Lock()
         self._list_cache = {}
+        self._list_inflight: Dict[tuple, asyncio.Task] = {}
 
     @staticmethod
     def _format_media(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -200,23 +230,239 @@ class AnimeService:
         }
         return localize_payload(result)
 
+    async def _post_anilist(self, client: httpx.AsyncClient, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+        sem = _anilist_semaphore()
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            async with sem:
+                try:
+                    resp = await client.post(
+                        ANILIST_API_URL,
+                        json={"query": query, "variables": variables},
+                        headers={"Content-Type": "application/json"},
+                    )
+                except httpx.HTTPError as exc:
+                    last_error = exc
+                    await asyncio.sleep(0.4 * (attempt + 1))
+                    continue
+
+            if resp.status_code == 429:
+                retry_after = min(2.0, float(resp.headers.get("Retry-After") or "1.0"))
+                last_error = httpx.HTTPStatusError("AniList rate limited", request=resp.request, response=resp)
+                await asyncio.sleep(retry_after)
+                continue
+            if resp.status_code >= 500:
+                last_error = httpx.HTTPStatusError("AniList upstream error", request=resp.request, response=resp)
+                await asyncio.sleep(0.4 * (attempt + 1))
+                continue
+
+            resp.raise_for_status()
+            payload = resp.json()
+            if payload.get("errors"):
+                raise ValueError(f"AniList returned GraphQL error: {payload['errors']}")
+            return payload
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("AniList request failed")
+
+    async def _local_catalog_fallback(self, variables: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Filter persisted CatalogEntry rows when upstream AniList is unavailable."""
+        from sqlalchemy import select
+        from app.database import AsyncSessionLocal
+        from app.models import CatalogEntry
+
+        try:
+            async with AsyncSessionLocal() as session:
+                rows = (await session.execute(select(CatalogEntry.payload))).scalars().all()
+        except Exception:
+            return None
+        if not rows:
+            return None
+
+        ids_filter = set(variables.get("ids") or [])
+        search_raw = str(variables.get("search") or "").strip()
+        search_norm = normalize_search(search_raw)
+        search_comp = compact_search(search_raw)
+        genre_filter = (variables.get("genre") or "").casefold()
+        season_year = variables.get("seasonYear")
+        start_gt = variables.get("startDate_greater")
+        start_lt = variables.get("startDate_lesser")
+        status_filter = variables.get("status")
+        status_in = set(variables.get("status_in") or [])
+        format_filter = variables.get("format")
+
+        matched: List[Dict[str, Any]] = []
+        for raw_payload in rows:
+            try:
+                item = json.loads(raw_payload)
+            except (ValueError, TypeError):
+                continue
+            aid = item.get("id")
+            if not aid:
+                continue
+            if ids_filter and aid not in ids_filter:
+                continue
+            if search_norm:
+                candidates = [
+                    item.get("title"),
+                    item.get("title_english"),
+                    item.get("title_ar"),
+                    *(item.get("title_aliases") or []),
+                ]
+                if not any(
+                    search_norm in normalize_search(c)
+                    or (len(search_comp) >= 3 and search_comp in compact_search(c))
+                    for c in candidates
+                    if c
+                ):
+                    continue
+            if genre_filter:
+                genres = [str(g.get("name") or "").casefold() for g in (item.get("genres") or []) if isinstance(g, dict)]
+                if genre_filter not in genres:
+                    continue
+            year_val = item.get("release_year")
+            if season_year and year_val != season_year:
+                continue
+            if start_gt is not None or start_lt is not None:
+                if not year_val:
+                    continue
+                y_min = (start_gt // 10000) + 1 if start_gt is not None else 0
+                y_max = (start_lt - 1) // 10000 if start_lt is not None else 9999
+                if not (y_min <= year_val <= y_max):
+                    continue
+            if status_filter and item.get("status") != status_filter:
+                continue
+            if status_in and item.get("status") not in status_in:
+                continue
+            if format_filter:
+                mt = item.get("media_type")
+                if format_filter == "MOVIE" and mt != "MOVIE":
+                    continue
+                if format_filter in ("TV", "TV_SHORT", "ONA") and mt != "SERIES":
+                    continue
+            matched.append({**item, "episodes": []})
+
+        sort_list = variables.get("sort") or ["POPULARITY_DESC"]
+        primary_sort = sort_list[0] if isinstance(sort_list, list) and sort_list else "POPULARITY_DESC"
+        if primary_sort == "SCORE_DESC":
+            matched.sort(key=lambda x: (x.get("average_score") or 0, x.get("popularity") or 0), reverse=True)
+        elif primary_sort == "START_DATE_DESC":
+            matched.sort(key=lambda x: (x.get("release_year") or 0, x.get("popularity") or 0), reverse=True)
+        elif primary_sort == "TITLE_ROMAJI":
+            matched.sort(key=lambda x: str(x.get("title_english") or x.get("title") or "").casefold())
+        elif primary_sort == "EPISODES_DESC":
+            matched.sort(key=lambda x: (x.get("total_episodes") or 0, x.get("popularity") or 0), reverse=True)
+        else:
+            matched.sort(key=lambda x: (x.get("popularity") or 0, x.get("average_score") or 0), reverse=True)
+
+        page = max(1, int(variables.get("page") or 1))
+        per_page = max(1, int(variables.get("perPage") or 24))
+        total = len(matched)
+        start = (page - 1) * per_page
+        page_items = matched[start:start + per_page]
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        return {
+            "items": page_items,
+            "total": total,
+            "page": page,
+            "page_size": per_page,
+            "total_pages": total_pages,
+            "has_next_page": page < total_pages,
+        }
+
+    async def _fetch_list_uncached(self, variables: Dict[str, Any], db_key: str, mem_key: str, raw_search: Optional[str] = None) -> Dict[str, Any]:
+        client = await _get_client()
+        try:
+            payload = await self._post_anilist(client, ANIME_LIST_QUERY, variables)
+            data = payload.get("data", {}).get("Page", {})
+            media_list = list(data.get("media", []))
+            page_info = data.get("pageInfo", {})
+
+            # Expand single-franchise curated ID hits with AniList text search so
+            # sequels/seasons/movies and year+search filters work seamlessly.
+            ids = variables.get("ids")
+            if ids and 1 <= len(ids) <= 3 and "search" not in variables and variables.get("page", 1) == 1:
+                franchise_en = english_query_for_ids(ids)
+                if franchise_en:
+                    expanded_vars = {k: v for k, v in variables.items() if k != "ids"}
+                    expanded_vars["search"] = franchise_en
+                    if expanded_vars.get("sort") == ["POPULARITY_DESC"]:
+                        expanded_vars["sort"] = ["SEARCH_MATCH", "POPULARITY_DESC"]
+                    try:
+                        extra_payload = await self._post_anilist(client, ANIME_LIST_QUERY, expanded_vars)
+                        extra_page = extra_payload.get("data", {}).get("Page", {})
+                        extra_media = extra_page.get("media", [])
+                        seen_ids = {m["id"] for m in media_list}
+                        for m in extra_media:
+                            if m["id"] not in seen_ids:
+                                seen_ids.add(m["id"])
+                                media_list.append(m)
+                        per_page = int(variables.get("perPage") or 24)
+                        media_list = media_list[:per_page]
+                        extra_info = extra_page.get("pageInfo") or {}
+                        if len(media_list) > len(data.get("media", [])):
+                            page_info = {
+                                **page_info,
+                                "total": max(int(page_info.get("total") or 0), int(extra_info.get("total") or len(media_list))),
+                                "lastPage": max(int(page_info.get("lastPage") or 1), int(extra_info.get("lastPage") or 1)),
+                                "hasNextPage": bool(page_info.get("hasNextPage") or extra_info.get("hasNextPage")),
+                            }
+                    except Exception:
+                        pass
+
+            if not media_list and raw_search and has_arabic(raw_search):
+                local = await self._local_catalog_fallback({**variables, "ids": None, "search": raw_search})
+                if local and local.get("items"):
+                    return local
+
+            items = [self._format_media(m) for m in media_list]
+            await db_cache.set_many({f"anime:{item['id']}": item for item in items}, TTL_ANIME_DETAIL)
+            for it in items:
+                if len(self._anime_cache) >= self._MAX_CACHE_SIZE:
+                    del self._anime_cache[next(iter(self._anime_cache))]
+                self._anime_cache[it["id"]] = it
+            full_result = {
+                "items": [{**item, "episodes": []} for item in items],
+                "total": page_info.get("total", len(items)),
+                "page": page_info.get("currentPage", variables.get("page", 1)),
+                "page_size": page_info.get("perPage", variables.get("perPage", 24)),
+                "total_pages": page_info.get("lastPage", 1),
+                "has_next_page": bool(page_info.get("hasNextPage")),
+            }
+            if len(self._list_cache) >= self._MAX_LIST_CACHE:
+                del self._list_cache[next(iter(self._list_cache))]
+            self._list_cache[mem_key] = (time.monotonic() + TTL_LIST, full_result)
+            await db_cache.set(db_key, full_result, TTL_LIST)
+            return full_result
+        except Exception:
+            stale = await db_cache.get_stale(db_key)
+            if stale is not None:
+                self._list_cache[mem_key] = (time.monotonic() + 120, stale)
+                return stale
+            local = await self._local_catalog_fallback(variables)
+            if local is not None:
+                return local
+            raise
+
     @public_titles
-    async def _query_list(self, variables: Dict[str, Any], allow_hidden: bool = False) -> Dict[str, Any]:
-        import json
+    async def _query_list(self, variables: Dict[str, Any], allow_hidden: bool = False, raw_search: Optional[str] = None) -> Dict[str, Any]:
         from app.services.anime_override_service import anime_override_service
         raw_key = json.dumps(variables, sort_keys=True)
         mem_key = raw_key
         db_key = f"list:{raw_key}"
         hidden_ids = anime_override_service.get_hidden_anime_ids_sync()
 
+        def apply_hidden(payload: Dict[str, Any]) -> Dict[str, Any]:
+            if not allow_hidden and hidden_ids and "items" in payload:
+                filtered = [it for it in payload["items"] if it.get("id") not in hidden_ids]
+                return {**payload, "items": filtered, "total": len(filtered)}
+            return payload
+
         # L1 memory cache
         cached = self._list_cache.get(mem_key)
         if cached and cached[0] > time.monotonic():
-            data = cached[1]
-            if not allow_hidden and hidden_ids and "items" in data:
-                filtered = [it for it in data["items"] if it.get("id") not in hidden_ids]
-                return {**data, "items": filtered, "total": len(filtered)}
-            return data
+            return apply_hidden(cached[1])
 
         # L2 DB cache — survives restarts and is shared across workers
         db_hit = await db_cache.get(db_key)
@@ -224,53 +470,47 @@ class AnimeService:
             if len(self._list_cache) >= self._MAX_LIST_CACHE:
                 del self._list_cache[next(iter(self._list_cache))]
             self._list_cache[mem_key] = (time.monotonic() + TTL_LIST, db_hit)
-            if not allow_hidden and hidden_ids and "items" in db_hit:
-                filtered = [it for it in db_hit["items"] if it.get("id") not in hidden_ids]
-                return {**db_hit, "items": filtered, "total": len(filtered)}
-            return db_hit
+            return apply_hidden(db_hit)
 
-        # Cache miss: fetch from AniList
-        client = await _get_client()
-        resp = await client.post(
-            ANILIST_API_URL,
-            json={"query": ANIME_LIST_QUERY, "variables": variables},
-            headers={"Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        data = resp.json().get("data", {}).get("Page", {})
-        media_list = data.get("media", [])
-        items = [self._format_media(m) for m in media_list]
-        await db_cache.set_many({f"anime:{item['id']}": item for item in items}, TTL_ANIME_DETAIL)
-        for it in items:
-            if len(self._anime_cache) >= self._MAX_CACHE_SIZE:
-                del self._anime_cache[next(iter(self._anime_cache))]
-            self._anime_cache[it["id"]] = it
-        page_info = data.get("pageInfo", {})
-        full_result = {
-            "items": [{**item, "episodes": []} for item in items],
-            "total": page_info.get("total", len(items)),
-            "page": page_info.get("currentPage", variables.get("page", 1)),
-            "page_size": page_info.get("perPage", variables.get("perPage", 24)),
-            "total_pages": page_info.get("lastPage", 1),
-            "has_next_page": bool(page_info.get("hasNextPage")),
-        }
-        if len(self._list_cache) >= self._MAX_LIST_CACHE:
-            del self._list_cache[next(iter(self._list_cache))]
-        self._list_cache[mem_key] = (time.monotonic() + TTL_LIST, full_result)
-        await db_cache.set(db_key, full_result, TTL_LIST)
+        inflight_key = (id(asyncio.get_running_loop()), mem_key)
+        task = self._list_inflight.get(inflight_key)
+        if task is None:
+            task = asyncio.create_task(self._fetch_list_uncached(variables, db_key, mem_key, raw_search=raw_search))
+            self._list_inflight[inflight_key] = task
+        try:
+            full_result = await task
+        finally:
+            if self._list_inflight.get(inflight_key) is task:
+                self._list_inflight.pop(inflight_key, None)
 
-        if not allow_hidden and hidden_ids:
-            filtered = [it for it in full_result["items"] if it.get("id") not in hidden_ids]
-            return {**full_result, "items": filtered, "total": len(filtered)}
-        return full_result
+        return apply_hidden(full_result)
 
     async def browse(self, page=1, per_page=24, search=None, genre=None, year=None, season=None, status=None, format=None, sort="POPULARITY_DESC", allow_hidden=False):
-        variables = {"page": page, "perPage": per_page, "sort": [sort]}
+        sort_value = ["SEARCH_MATCH", "POPULARITY_DESC"] if (search and sort == "POPULARITY_DESC") else [sort]
+        variables: Dict[str, Any] = {"page": page, "perPage": per_page, "sort": sort_value}
         if search:
             variables.update(provider_filters(search))
-        for key, value in {"genre": genre, "seasonYear": year, "season": season, "status": status, "format": format}.items():
+        for key, value in {"genre": genre, "season": season, "status": status, "format": format}.items():
             if value:
                 variables[key] = value
+        if year:
+            if season:
+                variables["seasonYear"] = year
+            else:
+                # Calendar date range captures movies/OVAs/specials lacking seasonYear on AniList.
+                variables["startDate_greater"] = year * 10000 - 1
+                variables["startDate_lesser"] = (year + 1) * 10000
+        if sort == "START_DATE_DESC" and not status:
+            now = datetime.now()
+            if year is None or year <= now.year:
+                today_bound = int(now.strftime("%Y%m%d")) + 1
+                variables["status_in"] = ["RELEASING", "FINISHED"]
+                if "startDate_lesser" in variables:
+                    variables["startDate_lesser"] = min(variables["startDate_lesser"], today_bound)
+                else:
+                    variables["startDate_lesser"] = today_bound
+        if search and has_arabic(search):
+            return await self._query_list(variables, allow_hidden=allow_hidden, raw_search=search)
         return await self._query_list(variables, allow_hidden=allow_hidden)
 
     @public_titles
@@ -303,7 +543,7 @@ class AnimeService:
                 return data
 
             # L2 DB cache check inside the lock to avoid stampede
-            db_hit = await db_cache.get("homepage:v2")
+            db_hit = await db_cache.get("homepage:v3")
             if db_hit is not None:
                 self._home_cache = (time.monotonic() + TTL_HOMEPAGE, db_hit)
                 if hidden_ids:
@@ -323,7 +563,7 @@ class AnimeService:
             } } }"""
             try:
                 async with httpx.AsyncClient(timeout=15, limits=httpx.Limits(max_connections=30, max_keepalive_connections=10)) as client:
-                    entries = await latest_catalog(client, limit=28)
+                    entries = await latest_catalog(client)
                     if not entries:
                         raise ValueError("No published catalog entries available")
                     response = await client.post(ANILIST_API_URL, json={"query": query, "variables": {"ids": [entry["mal"] for entry in entries]}})
@@ -334,16 +574,37 @@ class AnimeService:
                     raw_items = payload["data"]["Page"]["media"]
                     items = {item["id"]: self._format_media(item) for item in raw_items}
                     by_mal = {item["idMal"]: item for item in raw_items}
-                    recent = sorted([entry for entry in entries if entry["mal"] in by_mal], key=lambda entry: entry["order"])
+                    recent = sorted(
+                        [entry for entry in entries if entry["mal"] in by_mal],
+                        key=lambda entry: entry.get("order", 0),
+                    )
                     async def available(entry):
                         try:
-                            sources = await asyncio.wait_for(resolve_episode_page(client, entry["source"], entry["mal"], entry["episode"]), timeout=24)
+                            raw = by_mal[entry["mal"]]
+                            formatted = items[raw["id"]]
+                            src = entry.get("source") or ""
+                            host = urlsplit(src).hostname or ""
+                            if host == "anime3rb.com":
+                                sources = await asyncio.wait_for(
+                                    anime3rb_resolve_sources(client, entry["mal"], formatted.get("title_english"), formatted.get("title_romaji"), entry["episode"]),
+                                    timeout=6,
+                                )
+                            elif is_live_anime4up_host(host):
+                                sources = await asyncio.wait_for(
+                                    live_resolve_sources(client, entry["mal"], formatted.get("title_english"), formatted.get("title_romaji"), entry["episode"]),
+                                    timeout=6,
+                                )
+                            elif src:
+                                sources = await asyncio.wait_for(
+                                    resolve_episode_page(client, src, entry["mal"], entry["episode"]),
+                                    timeout=6,
+                                )
+                            else:
+                                return None
                             if not any(source.get("type") in ("direct", "hls") for source in sources):
                                 return None
-                            raw = by_mal[entry["mal"]]
-                            item = {**items[raw["id"]], "available_episode": entry["episode"], "is_available": True, "direct_streamable": True}
-                            return item
-                        except (httpx.HTTPError, TimeoutError, ValueError):
+                            return {**formatted, "available_episode": entry["episode"], "is_available": True, "direct_streamable": True}
+                        except (httpx.HTTPError, TimeoutError, asyncio.TimeoutError, ValueError):
                             return None
                     checked = await asyncio.gather(*(available(entry) for entry in recent[:6]), return_exceptions=True)
                     available_items = [item for item in checked if isinstance(item, dict)]
@@ -362,7 +623,7 @@ class AnimeService:
                           "popular": sorted(ordered, key=lambda item: item["popularity"], reverse=True)[:5],
                           "recommended": sorted(ordered, key=lambda item: item.get("average_score") or 0, reverse=True)[:6]}
                 self._home_cache = (time.monotonic() + TTL_HOMEPAGE, result)
-                await db_cache.set("homepage:v2", result, TTL_HOMEPAGE)
+                await db_cache.set("homepage:v3", result, TTL_HOMEPAGE)
                 if hidden_ids:
                     return {
                         "featured": [i for i in result.get("featured", []) if i.get("id") not in hidden_ids],
@@ -374,6 +635,9 @@ class AnimeService:
             except (httpx.HTTPError, KeyError, ValueError, TypeError):
                 if self._home_cache:
                     return self._home_cache[1]
+                stale = await db_cache.get_stale("homepage:v3")
+                if stale is not None:
+                    return stale
                 raise
 
     async def get_trending(self, page: int = 1, per_page: int = 24, allow_hidden: bool = False) -> Dict[str, Any]:
