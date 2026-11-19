@@ -3,7 +3,7 @@ import hashlib
 import re
 import time
 from typing import Optional
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 import httpx
 from fastapi import HTTPException, Request
@@ -17,11 +17,42 @@ from app.services.video_http import get_video_client
 
 
 _MEM_ASSET_CACHE: dict[str, tuple[float, str]] = {}
+_ASSET_CACHE_MAX_TTL = 4 * 60 * 60
+
+
+def asset_cache_ttl(url: str, now: Optional[float] = None) -> int:
+    """Do not cache a signed HLS asset beyond the upstream URL's expiry."""
+    now = time.time() if now is None else now
+    parsed = urlsplit(url)
+    query = parse_qs(parsed.query)
+    expiries = []
+
+    # Several HLS hosts encode expiry as an epoch in the query or token path.
+    for key in ("expires", "expire", "exp", "e"):
+        for value in query.get(key, []):
+            if value.isdigit() and int(value) >= 1_000_000_000:
+                expiries.append(int(value))
+
+    # tnmr/cloudwindow links use s=<issued-at>&e=<lifetime-seconds>.
+    for start_key in ("s", "start", "st"):
+        starts = query.get(start_key, [])
+        durations = query.get("e", [])
+        if starts and durations and starts[0].isdigit() and durations[0].isdigit():
+            start, duration = int(starts[0]), int(durations[0])
+            if start >= 1_000_000_000 and 0 < duration < 7 * 24 * 60 * 60:
+                expiries.append(start + duration)
+
+    for value in re.findall(r"-(\d{10})-", url):
+        expiries.append(int(value))
+
+    ttl = _ASSET_CACHE_MAX_TTL
+    if expiries:
+        ttl = min(ttl, int(min(expiries) - now - 30))  # Leave a short safety margin.
+    return max(1, ttl)
 
 
 def remember_assets(assets: dict[str, str], ttl: int = 14400) -> None:
     now = time.time()
-    exp = now + ttl
     if len(_MEM_ASSET_CACHE) > 100000:
         to_delete = [k for k, v in _MEM_ASSET_CACHE.items() if now > v[0]]
         for k in to_delete[:20000]:
@@ -30,7 +61,7 @@ def remember_assets(assets: dict[str, str], ttl: int = 14400) -> None:
             for k in list(_MEM_ASSET_CACHE.keys())[:20000]:
                 _MEM_ASSET_CACHE.pop(k, None)
     for k, v in assets.items():
-        _MEM_ASSET_CACHE[k] = (exp, v)
+        _MEM_ASSET_CACHE[k] = (now + min(ttl, asset_cache_ttl(v, now)), v)
 
 
 def trusted_media(url: str) -> bool:
@@ -124,9 +155,14 @@ async def relay(
         else:
             url = await db_cache.get(cache_key)
             if url:
-                _MEM_ASSET_CACHE[cache_key] = (time.time() + 14400, url)
+                _MEM_ASSET_CACHE[cache_key] = (time.time() + asset_cache_ttl(url), url)
     else:
         url = selected["url"]
+
+    if asset and isinstance(url, str) and asset_cache_ttl(url) <= 1:
+        _MEM_ASSET_CACHE.pop(f"hls-asset:{source}:{asset}", None)
+        await db_cache.delete(f"hls-asset:{source}:{asset}")
+        raise HTTPException(410, "انتهت صلاحية رابط مقطع الفيديو")
 
     if not isinstance(url, str) or not trusted_media(url):
         raise HTTPException(404, "جزء الفيديو غير متاح")
@@ -167,7 +203,8 @@ async def relay(
                 user_agent=user_agent,
             )
             remember_assets(assets)
-            await db_cache.set_many(assets, playback_sources.TTL)
+            cache_ttl = min((asset_cache_ttl(url) for url in assets.values()), default=_ASSET_CACHE_MAX_TTL)
+            await db_cache.set_many(assets, cache_ttl)
             return Response(
                 text,
                 media_type="application/vnd.apple.mpegurl",
