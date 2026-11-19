@@ -50,6 +50,38 @@ class VoeSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(player_config('<script type="application/json">["invalid"]</script>'))
         self.assertIsNone(player_config(public_config({"direct_access_url": "https://example.com/a.mp4"})))
 
+    async def test_rotated_public_redirect_domain_resolves_hls(self):
+        playlist = "https://cdn.cloudwindow-route.com/master.m3u8?token=original"
+        def handler(request):
+            if request.url.host == "voe.sx":
+                return httpx.Response(200, text="window.location.href = 'https://arianathankspecial.com/e/abc123';")
+            if request.url.host == "arianathankspecial.com":
+                return httpx.Response(200, text=public_config({"source": playlist, "file_code": "abc123"}))
+            if request.url.path == "/master.m3u8":
+                return httpx.Response(200, text="#EXTM3U\n#EXTINF:1400,\nsegment.ts\n#EXT-X-ENDLIST")
+            return httpx.Response(206, content=b"\x47" * 64)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await resolve(client, "https://voe.sx/e/abc123", "VOE")
+        self.assertEqual(result["type"], "hls")
+        self.assertEqual(result["url"], playlist)
+
+    def test_html_entity_like_sequences_after_hash_amp_marker_are_not_corrupted(self):
+        import html
+        data = {"source": "https://cdn.cloudwindow-route.com/master.m3u8", "title": "test-entity-0123456789-abcdefghijklmnopqrstuvwxyz"}
+        encoded = base64.b64encode(json.dumps(data).encode()).decode()[::-1]
+        encoded = "".join(chr(ord(char) + 3) for char in encoded)
+        encoded = base64.b64encode(encoded.encode()).decode()
+        rot_payload = codecs.encode(encoded, "rot_13")
+        pos = next(
+            idx for idx in range(len(rot_payload))
+            if html.unescape(rot_payload[:idx] + "#&" + rot_payload[idx:]) != (rot_payload[:idx] + "#&" + rot_payload[idx:])
+        )
+        marked_payload = rot_payload[:pos] + "#&" + rot_payload[pos:]
+        markup = '<script type="application/json">' + json.dumps([marked_payload]) + '</script>'
+        parsed = player_config(markup)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["source"], data["source"])
+
 
 if __name__ == "__main__":
     unittest.main()

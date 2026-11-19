@@ -1,7 +1,6 @@
 """Read the public VOE player configuration without loading advertising scripts."""
 import base64
 import codecs
-import html
 import json
 import re
 from urllib.parse import urlsplit
@@ -10,13 +9,13 @@ import httpx
 
 from app.services.source_trace import record
 
-HOSTS = {"voe.sx", "shannoncoldalready.com"}
+HOSTS = {"voe.sx", "shannoncoldalready.com", "arianathankspecial.com"}
 
 
 def player_config(markup):
     for raw in re.findall(r'<script\b[^>]*type=["\x27]application/json["\x27][^>]*>(.*?)</script>', markup, re.S):
         try:
-            payload = json.loads(html.unescape(raw))
+            payload = json.loads(raw)
             if not isinstance(payload, list) or not payload or not isinstance(payload[0], str):
                 continue
             encoded = re.sub(r"@\$|\^\^|~@|%\?|\*~|!!|#&", "", codecs.decode(payload[0], "rot_13"))
@@ -31,20 +30,20 @@ def player_config(markup):
 
 
 async def resolve(client, url, name):
-    from app.services.animetna import playable_hls
+    from app.services.animetna import is_safe_public_https_url, playable_hls
     parsed = urlsplit(url)
     if parsed.scheme != "https" or parsed.hostname not in HOSTS or not re.fullmatch(r"/e/[a-z0-9]+", parsed.path):
         return None
     try:
         response = await client.get(url, timeout=7, follow_redirects=True)
         response.raise_for_status()
-        if response.url.host not in HOSTS:
+        if not is_safe_public_https_url(str(response.url)):
             return None
         # The host publishes a client-side redirect to its current player domain.
         redirect = re.search(r"window\.location\.href\s*=\s*['\"]([^'\"]+)['\"]", response.text)
         if redirect:
             target = urlsplit(redirect[1])
-            if target.scheme != "https" or target.hostname not in HOSTS or target.path != parsed.path:
+            if not is_safe_public_https_url(redirect[1]) or target.path != parsed.path:
                 return None
             response = await client.get(target.geturl(), timeout=7)
             response.raise_for_status()

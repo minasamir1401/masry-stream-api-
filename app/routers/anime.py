@@ -12,7 +12,7 @@ from app.services.anime_override_service import anime_override_service
 from app.services.playback_sources import playback_sources
 from app.services.hls_gateway import relay as relay_hls
 from app.services.video_http import get_video_client
-from app.services.animetna import HLS_MEDIA_SUFFIXES, MP4_MEDIA_SUFFIXES, is_anime4up_host, media_request_headers
+from app.services.animetna import MP4_MEDIA_SUFFIXES, is_anime4up_host, is_hls_media_host, media_request_headers
 from app.services.hero_images import hero_images
 from app.services.airing_schedule import airing_schedule
 from app.services.security_shield import security_shield
@@ -63,8 +63,9 @@ def sanitize_server_name(raw_name: str, server_num: int) -> str:
     name_lower = raw_name.lower()
     blocked_words = [
         "anime3rb", "anime4up", "animetna", "anslayer", "ok.ru",
-        "mp4upload", "share4max", "vidara", "mixdrop", "lulustream",
-        "voe", "uqload", ".shop", ".site", ".org", ".com", ".net", ".to", ".is"
+        "mp4upload", "share4max", "megamax", "vidara", "mixdrop", "lulustream",
+        "lplaygo", "voe", "arianathankspecial", "uqload", "kraken", "sendvid",
+        "mediafire", ".shop", ".site", ".org", ".com", ".net", ".to", ".is"
     ]
     has_blocked = any(word in name_lower for word in blocked_words)
     quality_match = re.search(r"(2160p?|4k|1080p?|fhd|720p?|hd|480p?|sd|360p?)", name_lower)
@@ -218,7 +219,7 @@ async def get_anime_stream(request: Request, anime_id: int, episode: int = 1, re
             token = await playback_sources.register(anime_id, episode, source)
             st_token = security_shield.generate_token(f"{anime_id}:{episode}:{token}", client_ip, user_agent, ttl_seconds=14400)
             source = {**source, "playback_url": f"/api/anime/{anime_id}/video/{episode}?source={token}&st={st_token}"}
-        elif source.get("type") == "hls" and (urlsplit(source["url"]).hostname or "").endswith(HLS_MEDIA_SUFFIXES) and not source.get("is_custom"):
+        elif source.get("type") == "hls" and is_hls_media_host(urlsplit(source["url"]).hostname) and not source.get("is_custom"):
             token = await playback_sources.register(anime_id, episode, source)
             # A stream token must remain valid while HLS.js requests later playlist
             # segments. The default five minute API token expires mid-episode.

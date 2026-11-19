@@ -31,6 +31,29 @@ class LuluStreamTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: self.fail("Unexpected request"))) as client:
             self.assertIsNone(await lulustream_video(client, "https://127.0.0.1/e/file123", "LuluStream"))
 
+    async def test_rotated_public_mirror_redirect_is_followed_safely(self):
+        def handler(request):
+            if request.url.host == "lulustream.com":
+                return httpx.Response(302, headers={"Location": "https://lplaygo.com/e/file123"})
+            if request.url.host == "lplaygo.com":
+                return httpx.Response(200, text="eval(function(p,a,c,k,e,d){}('0:[{1:\"https://cdn.tnmr.org/master.m3u8?token=original\"}]',10,2,'sources|file'.split('|'),0,{}))")
+            if request.url.path == "/master.m3u8":
+                return httpx.Response(200, text="#EXTM3U\n#EXTINF:1400,\nsegment.ts\n#EXT-X-ENDLIST")
+            return httpx.Response(206, content=b"\x47" * 64)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            source = await lulustream_video(client, "https://lulustream.com/e/file123", "LuluStream 1080p")
+        self.assertEqual(source["type"], "hls")
+        self.assertEqual(source["url"], "https://cdn.tnmr.org/master.m3u8?token=original")
+
+    async def test_redirect_to_loopback_is_blocked_before_request(self):
+        requested = []
+        def handler(request):
+            requested.append(str(request.url))
+            return httpx.Response(302, headers={"Location": "https://127.0.0.1/e/file123"})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            self.assertIsNone(await lulustream_video(client, "https://lulustream.com/e/file123", "LuluStream"))
+        self.assertEqual(len(requested), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

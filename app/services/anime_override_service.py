@@ -208,7 +208,7 @@ class AnimeOverrideService:
         await db.refresh(server)
 
         # Clear stream cache for this episode so the new server appears immediately
-        await db_cache.delete(f"stream:v4:{anime_id}:{episode_number}")
+        await db_cache.delete(f"stream:v5:{anime_id}:{episode_number}")
         return {
             "id": server.id,
             "anime_id": server.anime_id,
@@ -244,7 +244,7 @@ class AnimeOverrideService:
 
         await db.commit()
         await db.refresh(server)
-        await db_cache.delete(f"stream:v4:{server.anime_id}:{server.episode_number}")
+        await db_cache.delete(f"stream:v5:{server.anime_id}:{server.episode_number}")
         return {
             "id": server.id,
             "anime_id": server.anime_id,
@@ -268,7 +268,7 @@ class AnimeOverrideService:
 
         await db.delete(server)
         await db.commit()
-        await db_cache.delete(f"stream:v4:{anime_id}:{episode_number}")
+        await db_cache.delete(f"stream:v5:{anime_id}:{episode_number}")
         return True
 
 

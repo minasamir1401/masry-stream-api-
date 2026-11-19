@@ -27,8 +27,9 @@ class PlaybackSources:
         if not origin:
             return None
         # Resolve the same published file, never another server's list position.
+        target_type = server.get("type") if server.get("type") in ("direct", "hls") else "direct"
         results = await resolve_player(client, {"type": "embed", "url": origin, "name": server["name"]}, None, episode)
-        replacement = next((item for item in results if item.get("type") == "direct"), None)
+        replacement = next((item for item in results if item.get("type") == target_type), None)
         if replacement:
             await db_cache.set(self.key(anime_id, episode, token), replacement, self.TTL)
         return replacement

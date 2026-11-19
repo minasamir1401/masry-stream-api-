@@ -794,7 +794,7 @@ class AnimeService:
         romaji = item.get("title_romaji")
         id_mal = item.get("id_mal")
 
-        db_key = f"stream:v4:{anime_id}:{episode}"
+        db_key = f"stream:v5:{anime_id}:{episode}"
         result = None
         if not refresh and not custom_servers:
             result = await db_cache.get(db_key)

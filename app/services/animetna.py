@@ -1,5 +1,6 @@
 import asyncio
 import html
+import ipaddress
 import json
 import re
 import time
@@ -11,7 +12,7 @@ from app.services.source_trace import record
 
 
 BASE_URL = "https://animetna.com"
-SHARE4MAX_HOSTS = {"share4max.com", "share4max.org"}
+SHARE4MAX_HOSTS = {"share4max.com", "share4max.org", "megamax.me", "megamax.cam"}
 MP4UPLOAD_HOSTS = {"mp4upload.com", "www.mp4upload.com"}
 KRAKEN_HOSTS = {"krakenfiles.com", "www.krakenfiles.com"}
 SENDVID_HOSTS = {"sendvid.com", "www.sendvid.com"}
@@ -20,16 +21,61 @@ DIRECT_PLAYER_HOSTS = MP4UPLOAD_HOSTS | KRAKEN_HOSTS | SENDVID_HOSTS
 ANIME4UP_HOSTS = {"4c.c8ywrhg.shop", "4s.g22jrec.shop"}
 VIDARA_HOSTS = {"vidaraa.cc", "vidara.so"}
 UQLOAD_HOSTS = {"uqload.com", "www.uqload.com", "uqload.is", "www.uqload.is", "uqload.vc", "www.uqload.vc"}
-HLS_MEDIA_SUFFIXES = (".friwduh.shop", ".s1q2105.com", ".97bf1.com", ".cloudwindow-route.com", ".tnmr.org")
-VOE_HOSTS = {"voe.sx", "shannoncoldalready.com"}
-LULUSTREAM_HOSTS = {"lulustream.com", "luluvdo.com"}
+HLS_MEDIA_SUFFIXES = (".friwduh.shop", ".fbpue2d.shop", ".s1q2105.com", ".97bf1.com", ".cloudwindow-route.com", ".tnmr.org")
+VOE_HOSTS = {"voe.sx", "shannoncoldalready.com", "arianathankspecial.com"}
+LULUSTREAM_HOSTS = {"lulustream.com", "luluvdo.com", "lplaygo.com"}
 STREAMTAPE_HOSTS = {"streamtape.com", "streamtape.to", "streamta.pe", "streamtape.net"}
 VINOVO_HOSTS = {"vinovo.to", "vinovo.pro", "vinovo.net"}
 FIRESTREAM_HOSTS = {"firestream.to", "firestream.top"}
 DOOD_HOSTS = {"dood.to", "dood.so", "dood.ws", "dood.la", "ds2play.com", "dsvplay.com"}
 MEDIAFIRE_HOSTS = {"mediafire.com", "www.mediafire.com"}
-MP4_MEDIA_SUFFIXES = (".mp4upload.com", ".krakencloud.net", ".sendvid.com", ".vid3rb.com", ".mxcontent.net")
+MP4_MEDIA_SUFFIXES = (".mp4upload.com", ".krakencloud.net", ".sendvid.com", ".vid3rb.com", ".mxcontent.net", ".mediafire.com")
 _episode_indexes = {}
+
+
+def is_share4max_host(host: str | None) -> bool:
+    clean = (host or "").lower().rstrip(".")
+    return clean in SHARE4MAX_HOSTS or clean.endswith((".share4max.com", ".share4max.org", ".megamax.me", ".megamax.cam"))
+
+
+def is_hls_media_host(host: str | None) -> bool:
+    clean = (host or "").lower().rstrip(".")
+    return bool(clean and (clean.endswith(HLS_MEDIA_SUFFIXES) or re.fullmatch(r"cdn\d+\.[a-z0-9]+\.shop", clean)))
+
+
+def is_safe_public_https_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme != "https" or parsed.port not in (None, 443) or not host or "." not in host:
+        return False
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal", ".lan", ".home.arpa")):
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        return True
+
+
+def _title_variants(english: str | None, romaji: str | None) -> list[str]:
+    variants = []
+    for title in (english, romaji):
+        if not title:
+            continue
+        variants.append(title)
+        x_norm = re.sub(r"\s+", " ", title.replace("×", "x")).strip()
+        if x_norm and x_norm != title:
+            variants.append(x_norm)
+        no_year = re.sub(r"\s*\(\d{4}\)", "", x_norm or title).strip()
+        if no_year and no_year not in (title, x_norm):
+            variants.append(no_year)
+        base = re.split(r"[:–—\-\|\/]", x_norm or title)[0].strip()
+        if base and base not in (title, x_norm, no_year):
+            variants.append(base)
+    return list(dict.fromkeys(variants))
 
 
 async def collect_available(awaitables, timeout=12):
@@ -48,11 +94,15 @@ async def collect_available(awaitables, timeout=12):
                 return_when=asyncio.FIRST_COMPLETED,
             )
             completed.update(done)
-            working = sum(
-                1 for t in completed
-                if not t.cancelled() and t.exception() is None and t.result()
-            )
-            if working >= 4:
+            working = 0
+            for t in completed:
+                if not t.cancelled() and t.exception() is None:
+                    res = t.result()
+                    if isinstance(res, list):
+                        working += len(res)
+                    elif res:
+                        working += 1
+            if working >= 3:
                 deadline = min(deadline, time.monotonic() + 1.5)
         return [task.result() for task in tasks
                 if task in completed and not task.cancelled() and task.exception() is None]
@@ -86,11 +136,9 @@ async def get_episode_index(client, id_mal, english, romaji):
     cached = _episode_indexes.get(cache_key)
     if cached and cached[0] > time.monotonic():
         return cached[1]
-    raw_titles = [title for title in (english, romaji) if title]
-    if not raw_titles:
+    titles = _title_variants(english, romaji)
+    if not titles:
         return {}
-    base_title = re.split(r"[:–—\-\|\/]", raw_titles[0])[0].strip()
-    titles = list(dict.fromkeys(raw_titles + ([base_title] if base_title else [])))
     expected = {re.sub(r"\W+", "", title.casefold()) for title in titles if title}
     candidates = {}
     for title in titles:
@@ -132,7 +180,7 @@ async def playable_hls(client, url, media_info=None):
     """Check the playlist and a real media segment, rather than an HTML wrapper."""
     for _ in range(3):
         parsed = urlsplit(url)
-        if parsed.scheme != "https" or not (parsed.hostname or "").endswith(HLS_MEDIA_SUFFIXES):
+        if parsed.scheme != "https" or not is_hls_media_host(parsed.hostname):
             return False
         response = await client.get(url, timeout=6)
         response.raise_for_status()
@@ -153,7 +201,7 @@ async def playable_hls(client, url, media_info=None):
         if "#EXT-X-ENDLIST" in response.text and duration < 60:
             return False
         segment = urlsplit(url)
-        if segment.scheme != "https" or not (segment.hostname or "").endswith(HLS_MEDIA_SUFFIXES):
+        if segment.scheme != "https" or not is_hls_media_host(segment.hostname):
             return False
         async with client.stream("GET", url, headers={"Range": "bytes=0-63"}, timeout=6) as sample:
             if sample.status_code not in (200, 206):
@@ -202,7 +250,7 @@ async def hls_video(client, server, id_mal, episode):
             return None
         media_url = json.loads(match[1])
         media = urlsplit(media_url)
-        if media.scheme != "https" or not (media.hostname or "").endswith(HLS_MEDIA_SUFFIXES):
+        if media.scheme != "https" or media.port not in (None, 443) or not is_hls_media_host(media.hostname):
             return None
         if not await playable_hls(client, media_url):
             return None
@@ -331,12 +379,24 @@ async def mixdrop_video(client, url, name):
 
 async def lulustream_video(client, url, name):
     parsed = urlsplit(url)
-    if parsed.scheme != "https" or parsed.hostname not in LULUSTREAM_HOSTS or not re.fullmatch(r"/e/[a-z0-9]+", parsed.path):
+    if parsed.scheme != "https" or parsed.hostname not in LULUSTREAM_HOSTS or not re.fullmatch(r"/e/[A-Za-z0-9]+", parsed.path):
         return None
     try:
-        response = await client.get(url, timeout=7, follow_redirects=True)
+        current = url
+        response = None
+        for _ in range(4):
+            response = await client.get(current, timeout=7, follow_redirects=False)
+            if response.status_code in (301, 302, 303, 307, 308) and response.headers.get("location"):
+                next_url = urljoin(current, response.headers["location"])
+                if not is_safe_public_https_url(next_url) or urlsplit(next_url).path != parsed.path:
+                    return None
+                current = next_url
+                continue
+            break
+        if response is None:
+            return None
         response.raise_for_status()
-        if response.url.host not in LULUSTREAM_HOSTS:
+        if not is_safe_public_https_url(str(response.url)):
             return None
         for data in unpack_player_data(response.text):
             match = re.search(r'sources\s*:\s*\[\s*\{\s*file\s*:\s*"([^"\n]+)"', data)
@@ -356,12 +416,12 @@ async def lulustream_video(client, url, name):
 
 async def share4max_videos(client, url):
     parsed = urlsplit(url)
-    if parsed.scheme != "https" or parsed.hostname not in SHARE4MAX_HOSTS or not re.fullmatch(r"/iframe/[A-Za-z0-9]+", parsed.path):
+    if parsed.scheme != "https" or not is_share4max_host(parsed.hostname) or not re.fullmatch(r"/(?:iframe|e)/[A-Za-z0-9]+", parsed.path):
         return []
     try:
         response = await client.get(url, follow_redirects=True, timeout=7)
         response.raise_for_status()
-        if response.url.host not in SHARE4MAX_HOSTS:
+        if not is_share4max_host(response.url.host):
             return []
         state = re.search(r'<script\b[^>]*data-page="app"[^>]*>(.*?)</script>', response.text, re.S)
         if not state:
@@ -383,17 +443,18 @@ async def share4max_videos(client, url):
                 link = mirror.get("link", "")
                 if link.startswith("//"):
                     link = "https:" + link
-                if urlsplit(link).hostname in DIRECT_PLAYER_HOSTS:
+                host = urlsplit(link).hostname
+                if host in DIRECT_PLAYER_HOSTS:
                     name = f"{mirror['driver']} — {quality.get('label', '')}".strip()
                     candidates.append(direct_video(client, link, name))
-                elif urlsplit(link).hostname in VIDARA_HOSTS:
+                elif host in VIDARA_HOSTS:
                     candidates.append(vidara_video(client, link, f"Vidara — {quality.get('label', '')}"))
-                elif urlsplit(link).hostname in MIXDROP_HOSTS:
+                elif host in MIXDROP_HOSTS:
                     candidates.append(mixdrop_video(client, link, f"Mixdrop — {quality.get('label', '')}"))
-                elif urlsplit(link).hostname in VOE_HOSTS:
+                elif host in VOE_HOSTS:
                     from app.services.voe import resolve as resolve_voe
                     candidates.append(resolve_voe(client, link, f"VOE — {quality.get('label', '')}"))
-                elif urlsplit(link).hostname in LULUSTREAM_HOSTS:
+                elif host in LULUSTREAM_HOSTS:
                     candidates.append(lulustream_video(client, link, f"LuluStream — {quality.get('label', '')}"))
         results = await collect_available(candidates, timeout=10)
         return [server for server in results if isinstance(server, dict)]
@@ -410,7 +471,9 @@ async def resolve_mediafire(client, url):
         if response.status_code == 200:
             match = re.search(r'href="(https?://download\d+\.mediafire\.com/[^"]+)"', response.text)
             if match:
-                return {"name": "Mediafire FHD", "type": "direct", "url": match.group(1)}
+                media_url = html.unescape(match.group(1))
+                if await playable_mp4(client, media_url):
+                    return {"name": "Mediafire FHD", "type": "direct", "url": media_url, "source_url": url}
     except Exception:
         pass
     return None
@@ -423,22 +486,13 @@ async def resolve_player(client, server, id_mal, episode):
     host = urlsplit(server["url"]).hostname or ""
     if host in MEDIAFIRE_HOSTS:
         mf = await resolve_mediafire(client, server["url"])
-        if mf:
-            return [mf]
-        return []
-    if host in SHARE4MAX_HOSTS:
-        s4m = await share4max_videos(client, server["url"])
-        if s4m:
-            return s4m
-        valid = await validate_embed(client, server)
-        return [valid] if valid else []
+        return [mf] if mf else []
+    if is_share4max_host(host):
+        return await share4max_videos(client, server["url"])
     if host in DIRECT_PLAYER_HOSTS:
         result = await direct_video(client, server["url"], server["name"])
-        if result:
-            return [result]
-        valid = await validate_embed(client, server)
-        return [valid] if valid else []
-    elif is_anime4up_host(host):
+        return [result] if result else []
+    if is_anime4up_host(host):
         result = await hls_video(client, server, id_mal, episode)
     elif host in VIDARA_HOSTS:
         result = await vidara_video(client, server["url"], server["name"])
@@ -449,13 +503,8 @@ async def resolve_player(client, server, id_mal, episode):
         result = await mixdrop_video(client, server["url"], server["name"])
     elif host in LULUSTREAM_HOSTS:
         result = await lulustream_video(client, server["url"], server["name"])
-    elif host in STREAMTAPE_HOSTS or host in VINOVO_HOSTS or host in FIRESTREAM_HOSTS or host in DOOD_HOSTS:
-        valid = await validate_embed(client, server)
-        return [valid] if valid else []
-    elif host in UQLOAD_HOSTS:
-        return []
     else:
-        result = await validate_embed(client, server)
+        return []
     return [result] if result else []
 
 
@@ -535,11 +584,9 @@ async def resolve_servers(client, id_mal, english, romaji, episode):
     cached = _episode_indexes.get(cache_key)
     if cached and cached[0] > time.monotonic() and episode in cached[1]:
         return await resolve_episode_page(client, cached[1][episode], id_mal, episode)
-    raw_titles = [title for title in (english, romaji) if title]
-    if not raw_titles:
+    titles = _title_variants(english, romaji)
+    if not titles:
         return []
-    base_title = re.split(r"[:–—\-\|\/]", raw_titles[0])[0].strip()
-    titles = list(dict.fromkeys(raw_titles + ([base_title] if base_title else [])))
     queries = list(dict.fromkeys(titles + [re.split(r"\W+", titles[0])[0]]))
     candidates = {}
     for query in queries:
@@ -608,8 +655,8 @@ async def resolve_episode_page(client, selected, id_mal, episode):
             if url.startswith("//"):
                 url = "https:" + url
             host = urlsplit(url).hostname
-            if host in {"ok.ru"} | DIRECT_PLAYER_HOSTS | SHARE4MAX_HOSTS | VIDARA_HOSTS | UQLOAD_HOSTS | VOE_HOSTS | MIXDROP_HOSTS or is_anime4up_host(host):
-                display_name = "Share4Max" if host in SHARE4MAX_HOSTS else name
+            if host in DIRECT_PLAYER_HOSTS | VIDARA_HOSTS | VOE_HOSTS | MIXDROP_HOSTS | LULUSTREAM_HOSTS | MEDIAFIRE_HOSTS or is_share4max_host(host) or is_anime4up_host(host):
+                display_name = "Share4Max" if is_share4max_host(host) else name
                 if is_anime4up_host(host):
                     display_name = "بث مباشر " + ("2" if "/Anime4up-S2/" in url else "1")
                 options.append({"name": display_name, "type": "embed", "url": html.unescape(url)})
@@ -618,10 +665,10 @@ async def resolve_episode_page(client, selected, id_mal, episode):
                 return await asyncio.wait_for(resolve_player(client, server, id_mal, episode), timeout=20)
             except (httpx.HTTPError, TimeoutError, ValueError, TypeError, KeyError):
                 return []
-        checked = await collect_available((checked_player(server) for server in options))
+        checked = await collect_available((checked_player(server) for server in options), timeout=18)
         return sorted(
-            [server for group in checked for server in group],
-            key=lambda server: (server["type"] == "embed", not any(q in server["name"] for q in ("1080", "FHD")), "mp4upload" not in server["url"]),
+            [server for group in checked for server in group if server.get("type") in ("direct", "hls")],
+            key=lambda server: (server["type"] != "hls", not any(q in server["name"] for q in ("1080", "FHD")), "mp4upload" not in server["url"]),
         )
 
 

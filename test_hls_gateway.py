@@ -3,8 +3,13 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from app.services.hls_gateway import relay, rewrite_playlist
+
+
+def _request():
+    return Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": [(b"user-agent", b"test-browser")]})
 
 
 class HlsGatewayTests(unittest.IsolatedAsyncioTestCase):
@@ -44,7 +49,7 @@ class HlsGatewayTests(unittest.IsolatedAsyncioTestCase):
             response = await relay(21459, 12, "a" * 24, "b" * 24, "bytes=0-63")
             self.assertEqual(len(b"".join([part async for part in response.body_iterator])), 64)
         self.assertEqual(response.status_code, 206)
-        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(response.headers["Cache-Control"], "public, max-age=86400, immutable")
         self.assertFalse(client.is_closed)
 
     async def test_every_ip_bound_hls_host_is_served_through_our_origin(self):
@@ -57,10 +62,10 @@ class HlsGatewayTests(unittest.IsolatedAsyncioTestCase):
                    return_value={"availability": "available", "servers": servers}), \
              patch("app.routers.anime.playback_sources.register", new_callable=AsyncMock, return_value="c" * 24), \
              patch("app.routers.anime.anime_override_service.get_hidden_anime_ids_sync", return_value=set()):
-            result = await get_anime_stream(101348, 5)
+            result = await get_anime_stream(_request(), 101348, 5)
         relayed = [server for server in result["servers"] if not server.get("is_custom")]
         self.assertEqual(len(relayed), len(HLS_MEDIA_SUFFIXES))
-        self.assertTrue(all(server["playback_url"] == f"/api/anime/101348/hls/5?source={'c' * 24}" for server in relayed))
+        self.assertTrue(all(server["playback_url"].startswith(f"/api/anime/101348/hls/5?source={'c' * 24}&st=") for server in relayed))
         self.assertNotIn("playback_url", result["servers"][-1])
 
 

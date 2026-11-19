@@ -9,7 +9,7 @@ import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
-from app.services.animetna import HLS_MEDIA_SUFFIXES
+from app.services.animetna import is_hls_media_host
 from app.services.db_cache import db_cache
 from app.services.playback_sources import playback_sources
 from app.services.security_shield import security_shield
@@ -36,7 +36,7 @@ def remember_assets(assets: dict[str, str], ttl: int = 14400) -> None:
 def trusted_media(url: str) -> bool:
     try:
         parsed = urlsplit(url)
-        return parsed.scheme == "https" and (parsed.hostname or "").endswith(HLS_MEDIA_SUFFIXES) and parsed.port in (None, 443)
+        return parsed.scheme == "https" and is_hls_media_host(parsed.hostname) and parsed.port in (None, 443)
     except ValueError:
         return False
 
@@ -47,8 +47,8 @@ def rewrite_playlist(
     anime_id: int,
     episode: int,
     source: str,
-    client_ip: str,
-    user_agent: str,
+    client_ip: str = "127.0.0.1",
+    user_agent: str = "",
 ) -> tuple[str, dict]:
     assets = {}
     segment_token = security_shield.generate_token(
@@ -141,6 +141,12 @@ async def relay(
     upstream = None
     try:
         upstream = await client.send(client.build_request("GET", url, headers=headers), stream=True)
+        if not asset and upstream.status_code in (401, 403, 404, 410) and selected.get("source_url"):
+            await upstream.aclose()
+            renewed = await playback_sources.renew(client, anime_id, episode, source, selected)
+            if renewed and trusted_media(renewed.get("url", "")):
+                url = renewed["url"]
+                upstream = await client.send(client.build_request("GET", url, headers=headers), stream=True)
         if upstream.status_code not in (200, 206) or not trusted_media(str(upstream.url)):
             await upstream.aclose()
             raise HTTPException(502, "تعذّر جلب جزء الفيديو من المصدر")

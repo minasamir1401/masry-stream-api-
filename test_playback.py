@@ -254,6 +254,35 @@ class PlaybackRegressionTests(unittest.IsolatedAsyncioTestCase):
                     result = await resolver.resolve_streams_for_anime(123)
         self.assertEqual(result["servers"], [source])
 
+    async def test_ad_ridden_embed_hosts_never_fall_back_to_iframe(self):
+        from app.services.animetna import resolve_player
+        def handler(request):
+            if request.url.host in ("share4max.com", "megamax.me"):
+                return httpx.Response(200, text="<html>no streams</html>")
+            if request.url.host == "mp4upload.com":
+                return httpx.Response(200, text="<html>File was deleted</html>")
+            return httpx.Response(200, text="<html>player</html>")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            for url in (
+                "https://share4max.com/iframe/abc123",
+                "https://megamax.me/iframe/abc123",
+                "https://mp4upload.com/embed-abc123.html",
+                "https://streamtape.com/e/abc123",
+                "https://dood.to/e/abc123",
+                "https://ok.ru/videoembed/12345",
+            ):
+                self.assertEqual(await resolve_player(client, {"name": "test", "type": "embed", "url": url}, 11061, 1), [])
+
+    async def test_rotated_anime4up_s2_cdn_is_playable_hls(self):
+        def handler(request):
+            if request.url.path == "/master.m3u8":
+                return httpx.Response(200, text="#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5500000,RESOLUTION=1920x1080\nindex.m3u8")
+            if request.url.path == "/index.m3u8":
+                return httpx.Response(200, text="#EXTM3U\n#EXTINF:1400,\nseg.ts\n#EXT-X-ENDLIST")
+            return httpx.Response(206, content=b"\x47" * 64)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            self.assertTrue(await playable_hls(client, "https://cdn2.fbpue2d.shop/master.m3u8"))
+
 
 if __name__ == "__main__":
     unittest.main()

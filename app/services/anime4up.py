@@ -9,11 +9,10 @@ from urllib.parse import urlsplit
 
 import httpx
 from app.services.animetna import (
-    SHARE4MAX_HOSTS,
     MP4UPLOAD_HOSTS,
     VOE_HOSTS,
     MIXDROP_HOSTS,
-    validate_embed,
+    is_share4max_host,
     resolve_player,
     collect_available,
 )
@@ -23,6 +22,7 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://anime4up.uno"
 _anime_cache = {}
 _episode_cache = {}
+_host_dead_until = 0.0
 
 
 def slug(text: str) -> str:
@@ -31,6 +31,9 @@ def slug(text: str) -> str:
 
 
 async def get_anime4up_episodes(client: httpx.AsyncClient, id_mal: int | None, english: str | None, romaji: str | None) -> dict[int, str]:
+    global _host_dead_until
+    if time.monotonic() < _host_dead_until:
+        return {}
     cache_key = id_mal or english or romaji
     if not cache_key:
         return {}
@@ -57,6 +60,9 @@ async def get_anime4up_episodes(client: httpx.AsyncClient, id_mal: int | None, e
         url = f"{BASE_URL}/anime/{s}/"
         try:
             resp = await client.get(url, timeout=7, follow_redirects=True)
+            if resp.status_code == 404 and "DEPLOYMENT_NOT_FOUND" in resp.text:
+                _host_dead_until = time.monotonic() + 600
+                return {}
             if resp.status_code == 200:
                 mal_ids_on_page = re.findall(r"myanimelist\.net/anime/(\d+)", resp.text)
                 if id_mal and mal_ids_on_page:
@@ -108,22 +114,15 @@ async def resolve_sources(client: httpx.AsyncClient, id_mal: int | None, english
             seen.add(s_url)
 
             host = urlsplit(s_url).hostname or ""
-            if host in SHARE4MAX_HOSTS:
+            if is_share4max_host(host):
                 options.append({"name": "سيرفر رئيسي FHD", "type": "embed", "url": s_url})
             elif host in MP4UPLOAD_HOSTS:
                 options.append({"name": "Mp4upload", "type": "embed", "url": s_url})
             elif host in VOE_HOSTS | MIXDROP_HOSTS:
                 options.append({"name": "VOE" if host in VOE_HOSTS else "Mixdrop", "type": "embed", "url": s_url})
-            elif "mega.nz" in host:
-                options.append({"name": "سيرفر ميجا", "type": "embed", "url": s_url})
-            elif "ok.ru" in host:
-                options.append({"name": "OK.ru", "type": "embed", "url": s_url})
-            elif any(d in host for d in ("4shared.com", "uptostream.com", "dsvplay.com", "vadbam.com")):
-                name = host.split(".")[0].capitalize()
-                options.append({"name": name, "type": "embed", "url": s_url})
 
         checked = await collect_available((resolve_player(client, opt, id_mal, episode) for opt in options))
-        results = [s for group in checked if isinstance(group, list) for s in group if s]
+        results = [s for group in checked if isinstance(group, list) for s in group if s and s.get("type") in ("direct", "hls")]
         return results
 
     except httpx.HTTPError as exc:
